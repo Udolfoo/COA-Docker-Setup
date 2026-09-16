@@ -1,0 +1,39 @@
+# ===========================================================================
+#  docker-compose.override.yml  (for this CoA server)
+# ---------------------------------------------------------------------------
+# 1) acore_world comes from the CoA world dump -> the AzerothCore auto-updater
+#    (ac-db-import) is turned into a no-op so that AC update SQL cannot
+#    overwrite the CoA content.
+#    To re-enable it: rename this file and run "docker compose up ac-db-import".
+#
+# 2) Log rotation: keeps container logs from growing without limit
+#    (max. 20 MB x 3 files per service).
+#
+# Note: coa-oneclick.sh / coa-update.sh write this file automatically when a
+#       CoA world dump was imported.
+# ===========================================================================
+
+services:
+  ac-db-import:
+    entrypoint: ["/bin/sh", "-c", "echo 'ac-db-import disabled: acore_world comes from the CoA dump'; exit 0"]
+
+  ac-worldserver:
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  ac-authserver:
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  ac-database:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
