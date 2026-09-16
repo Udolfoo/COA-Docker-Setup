@@ -212,7 +212,7 @@ The database root password lives in `/opt/azerothcore/.env`
 | Build fails: `use of undeclared identifier 'SPELL_EFFECT_NONE'` | run `bash coa-oneclick.sh` again – it patches the line automatically |
 | `docker compose up` fails on `ac-db-import ... exit 1` | the AC auto-updater tried to write into CoA data – `docker-compose.override.yml` must be present (the script creates it) |
 | Client log: "malformed packet" | the client sends plaintext world headers – apply `AscensionCompat.AllowRemoteClients = 1` (script) **and** patch `Extensions.dll` |
-| Client cannot enter the realm / crashes | apply `patch_world_endpoint.py` to `Extensions.dll` |
+| Client cannot enter the realm / crashes | apply `patch_world_endpoint.py` (from the CoA fork repository) to `Extensions.dll` |
 | `unrar: Unsupported Method` | the archive is RAR5 / WinRAR 7 – the script installs RARLAB's `unrar`; alternatively provide a `.zip` |
 | Port 3306 already in use | `DB_EXTERNAL_PORT=127.0.0.1:13306` (the default) – only needed if a host MySQL/MariaDB runs |
 | Vanity items: "has no AzerothCore item template yet" | CoA world data missing → import the CoA dump (`COA_WORLD_DUMP`) |
