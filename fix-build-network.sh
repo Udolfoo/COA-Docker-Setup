@@ -74,6 +74,22 @@ ipv6_usable() {
 
 have_image() { docker image inspect "$1" >/dev/null 2>&1; }
 
+fw_forward_policy() {  # FORWARD policy + number of Docker rules (Docker inserts its own ACCEPTs)
+    local pol rules
+    pol="$(iptables -S FORWARD 2>/dev/null | sed -n 's/^-P FORWARD //p' | head -1)"
+    rules="$(iptables -S FORWARD 2>/dev/null | grep -c DOCKER)"
+    if [ -z "$pol" ] && command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
+        pol="nftables(FORWARD chains: $(nft list ruleset 2>/dev/null | grep -c 'chain FORWARD'))"
+    fi
+    echo "policy=${pol:-unknown} dockerRules=${rules}"
+}
+
+container_dns_test() {  # 0 = the container resolves names, 1 = it cannot, 2 = no image
+    have_image "$TEST_IMAGE" || return 2
+    timeout "$TEST_TIMEOUT" docker run --rm "$TEST_IMAGE" \
+        sh -c 'getent hosts archive.ubuntu.com >/dev/null 2>&1'
+}
+
 container_apt_test() {  # 0 = works, 1 = fails, 2 = not testable (no local image)
     have_image "$TEST_IMAGE" || return 2
     local out=/tmp/coa_apt_test.log attempt rc=1
@@ -115,6 +131,18 @@ case "$APT_RC" in
        info "the build itself is the real check; the fixes below use the evidence above" ;;
     *) warn "apt-get update fails inside a container" ;;
 esac
+
+if [ "$APT_RC" != "0" ]; then
+    # Split the failure: DNS inside the container vs. routing/firewall.
+    container_dns_test
+    case "$?" in
+        0) info "the container resolves names -> DNS is fine, so it is routing/firewall" ;;
+        1) warn "the container cannot resolve names -> DNS is the problem" ;;
+        2) : ;;
+    esac
+    info "FORWARD chain: $(fw_forward_policy)   (a DROP policy is fine as long as dockerRules>0)"
+    info "ip_forward: $(sysctl -n net.ipv4.ip_forward 2>/dev/null)   (must be 1)"
+fi
 
 # ------------------------------------------------------------------- repair
 if stub_only_resolv_conf; then
@@ -170,5 +198,7 @@ info "  host:      curl -sI http://archive.ubuntu.com/ubuntu/ | head -1"
 info "  container: docker run --rm $TEST_IMAGE sh -c 'cat /etc/resolv.conf'"
 info "  provider:  resolvectl dns | grep -v ':\$'"
 info "  IPv6:      curl -6 -sI http://archive.ubuntu.com/ | head -1   (empty/hanging = broken)"
+info "  firewall:  iptables -S FORWARD | head -3   (policy must be ACCEPT, docker adds its own rules)"
+info "  routing:   sysctl -n net.ipv4.ip_forward  (must be 1)"
 info "  proxy?     export HTTP_PROXY/HTTPS_PROXY and add \"proxies\" to /etc/docker/daemon.json"
 exit 0
