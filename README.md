@@ -25,7 +25,8 @@ fork (Conquest of AzerothCore) on your own Linux server – including a one-comm
 ```bash
 # 1) copy the scripts to your server (keep all files in the same folder)
 scp coa-oneclick.sh coa-update.sh apply-missing-updates.sh \
-    check-repo-updates.sh docker-compose.override.yml root@<SERVER-IP>:/root/
+    check-repo-updates.sh fix-build-network.sh fix-container-dns.sh \
+    docker-compose.override.yml root@<SERVER-IP>:/root/
 
 # 2) deploy (base: standard AzerothCore world, downloaded client data v20.0)
 bash /root/coa-oneclick.sh 2>&1 | tee /root/coa-deploy.log
@@ -210,6 +211,13 @@ The database root password lives in `/opt/azerothcore/.env`
   automatically (value `0` equals `SPELL_EFFECT_NONE`). If upstream fixes it, nothing happens.
 * **Your dump is only used partially:** only the `acore_world` section of a full mysqldump is
   imported, so accounts and characters on the target server stay untouched.
+* **A custom `dns` entry in `/etc/docker/daemon.json`** can end up in the containers instead of
+  Docker's embedded resolver `127.0.0.11`. The compose service names (`ac-database`, `ac-authserver`)
+  then no longer resolve and the worldserver stops with
+  `Unknown MySQL server host 'ac-database' (-3)`. `fix-build-network.sh` uses that entry to make
+  **builds** reach the apt mirrors; if the stack was recreated afterwards, run
+  `bash /root/fix-container-dns.sh` (it removes the entry, keeps `/etc/docker/daemon.json.bak-dns`
+  and recreates the containers).
 * **Backups & logs:** `acore_world_old` (world before the import, drop it when you are happy),
   `/root/updates_backup_acore_*.sql` (overwritten on every run), `/root/coa-deploy.log`,
   `/root/apply-missing-updates.log`.
@@ -235,6 +243,7 @@ The database root password lives in `/opt/azerothcore/.env`
 | `unrar: Unsupported Method` | the archive is RAR5 / WinRAR 7 – the script installs RARLAB's `unrar`; alternatively provide a `.zip` |
 | Port 3306 already in use | `DB_EXTERNAL_PORT=127.0.0.1:13306` (the default) – only needed if a host MySQL/MariaDB runs |
 | `coa-update.sh` looks frozen after `Starting worldserver ...` | `docker compose up` is waiting for a dependency (`ac-database` healthy, `ac-db-import` / `ac-client-data-init` completed) or the worldserver is in a crash loop. Current scripts report progress every 15 s, stop after 5 / 7 minutes and print the `ac-*` container states plus the last 30 log lines. Older copies polled the port for 4 minutes without any output. Manual check: `cd /opt/azerothcore && docker compose ps -a`, `docker logs --tail 50 ac-worldserver`, `docker logs --tail 20 ac-client-data-init`, `df -h /` |
+| Worldserver restart loop, log: `Could not connect to MySQL database at ac-database: Unknown MySQL server host 'ac-database' (-3)` + `DatabasePool Login NOT opened` | The container cannot resolve the compose service name – it uses a custom DNS server instead of Docker's embedded resolver `127.0.0.11`, or it is not attached to the network of `ac-database`. Run `bash /root/fix-container-dns.sh`: it prints the facts (resolv.conf, networks, aliases), removes a custom `"dns"` entry from `/etc/docker/daemon.json` (backup kept), restarts the Docker daemon and recreates the stack. Data stays in the volumes. A recreated stack also picks up the change, see `docker-compose.override.yml` |
 | Vanity items: "has no AzerothCore item template yet" | CoA world data missing → import the CoA dump (`COA_WORLD_DUMP`) |
 
 ---
@@ -295,6 +304,7 @@ cd /opt/azerothcore && docker compose up ac-db-import
 | `check-repo-updates.sh` | read-only check: which repo updates are not registered yet |
 | `docker-compose.override.yml` | disables the auto-updater for CoA world data + log rotation |
 | `fix-build-network.sh` | repairs container DNS/IPv6 so image builds can reach the apt mirrors |
+| `fix-container-dns.sh` | repairs container DNS/network when the worldserver cannot resolve `ac-database` (error -3) |
 | `transfer-data.sh` | copies the CoA world dump + client data from another server |
 | `check-dbc-rows.py` | verifies the CoA client DBC set the core requires (5 rows) |
 | `README.md` | this guide |

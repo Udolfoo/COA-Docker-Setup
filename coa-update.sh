@@ -60,10 +60,33 @@ ws_up() {
     port_open "$WORLD_PORT" && return 0
     return 1
 }
+ws_dns_diag() {   # prints facts only when the database container cannot be resolved
+    docker logs --tail 300 ac-worldserver 2>&1 \
+        | grep -qE 'Unknown MySQL server host|Could not connect to MySQL' || return 0
+    local c rc
+    echo "      --- container DNS / network (ac-database is not resolvable) ---"
+    for c in ac-worldserver ac-database; do
+        rc="$(docker inspect -f '{{.ResolvConfPath}}' "$c" 2>/dev/null)"
+        if [ -n "$rc" ] && [ -f "$rc" ]; then
+            printf "      %-14s resolv.conf: %s\n" "$c" \
+                "$(grep -v '^#' "$rc" 2>/dev/null | grep -v '^$' | tr '\n' ' ')"
+            grep -q '127\.0\.0\.11' "$rc" 2>/dev/null \
+                || echo "                     -> 127.0.0.11 (embedded DNS) MISSING in this container"
+        fi
+        printf "      %-14s networks  : %s\n" "$c" \
+            "$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}({{$v.IPAddress}}) {{end}}' "$c" 2>/dev/null)"
+        printf "      %-14s aliases   : %s\n" "$c" \
+            "$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$v.Aliases}} {{end}}' "$c" 2>/dev/null)"
+    done
+    [ -f /etc/docker/daemon.json ] && \
+        printf "      daemon.json    : %s\n" "$(tr -d '\n' < /etc/docker/daemon.json)"
+    echo "      repair: bash /root/fix-container-dns.sh   (recreates the containers with clean DNS)"
+}
 ws_diag() {
     echo "      --- diagnostics ---"
     docker ps -a --format '      {{.Names}}: {{.Status}}' 2>/dev/null \
         | grep -E 'ac-(worldserver|authserver|database|db-import|client-data-init)' || true
+    ws_dns_diag
     echo "      last log lines of ac-worldserver:"
     docker logs --tail 30 ac-worldserver 2>&1 | sed 's/^/        /' || true
     echo "      details: docker logs ac-worldserver   /   df -h /"
@@ -78,13 +101,13 @@ ws_wait() {   # <max_seconds> -> 0 = up, 1 = not up (diagnostics printed)
         state="$(ws_state)"
         restarts="$(ws_restarts)"
         case "$state" in
-            running|created|starting|paused) ;;
+            running|created|starting|paused|restarting) ;;
             *)
                 printf "  Worldserver container state is '%s' after %ss - it did not start.\n" "$state" "$waited"
                 ws_diag
                 return 1 ;;
         esac
-        if [ "${restarts:-0}" -gt 3 ] 2>/dev/null; then
+        if [ "${restarts:-0}" -gt 2 ] 2>/dev/null; then
             printf "  Worldserver restarted %s times without coming up - crash loop.\n" "$restarts"
             ws_diag
             return 1
