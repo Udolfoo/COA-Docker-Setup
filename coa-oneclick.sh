@@ -127,7 +127,7 @@ ok "Docker service: $(systemctl is-active docker)"
 
 if [ "$SKIP_SWAP" = "1" ]; then
     warn "Swap skipped (SKIP_SWAP=1)"
-elif swapon --show 2>/dev/null | grep -q .; then
+elif [ -n "$(swapon --show 2>/dev/null)" ]; then
     ok "Swap already active: $(swapon --show --noheadings | head -1 | tr -s ' ')"
 else
     # mkswap/swapon ship with util-linux; minimal clouds images may not have it
@@ -470,12 +470,26 @@ chown -R 1000:1000 "$ETC" 2>/dev/null || true
 # ------------------------------------------------------------ 8. Start
 step "8/9  Start + realm address"
 log "docker compose up -d"
-docker compose up -d 2>&1 | tail -4
+# output into a log file instead of "| tail -4" (tail prints only when the command
+# is done) so a blocking dependency is visible instead of looking like a freeze
+COMPOSE_LOG="/tmp/coa_compose_up.log"
+rc=0
+(timeout 300 docker compose up -d) >"$COMPOSE_LOG" 2>&1 || rc=$?
+tail -6 "$COMPOSE_LOG" | sed 's/^/      /'
+if [ "$rc" -ne 0 ]; then
+    warn "docker compose up returned ${rc} (124 = 5 minute limit: a dependency never became ready)"
+    tail -20 "$COMPOSE_LOG" | sed 's/^/      /'
+fi
+
+contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+port_open() { local o; o="$(ss -ltn 2>/dev/null)"; contains "$o" ":$1 "; }
 
 wait_init() {
     # waits until the worldserver port is listening
+    # (no "ss | grep -q": with `set -o pipefail` grep's early exit raises SIGPIPE
+    #  and the pipeline fails even though the port is open)
     for _i in $(seq 1 80); do
-        ss -ltn 2>/dev/null | grep -q ":${WORLD_PORT} " && return 0
+        port_open "$WORLD_PORT" && return 0
         sleep 3
     done
     return 1

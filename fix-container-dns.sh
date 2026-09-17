@@ -55,6 +55,8 @@ info() { printf '\033[0;36m[INFO ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN ]\033[0m %s\n' "$*"; }
 fail() { printf '\033[0;31m[FAIL ]\033[0m %s\n' "$*"; }
 step() { printf '\n\033[0;36m=== %s ===\033[0m\n' "$*"; }
+contains()    { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+port_open()   { local o; o="$(ss -ltn 2>/dev/null)"; contains "$o" ":$1 "; }
 state_of()   { docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null || echo missing; }
 nets_of()    { docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}({{$v.IPAddress}}) {{end}}' "$1" 2>/dev/null; }
 net_names()  { docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$1" 2>/dev/null; }
@@ -115,11 +117,14 @@ probe_worldserver_networks() {   # 0 = a container next to ac-worldserver resolv
     return 1
 }
 worldserver_db_error() {   # 0 = the log still shows the name resolution failure
-    docker logs --tail 200 ac-worldserver 2>&1 | grep -q 'Unknown MySQL server host'
+    # no "| grep -q" here: with `set -o pipefail` the early exit of grep makes
+    # the pipeline fail with SIGPIPE (141) although the line IS present
+    local o; o="$(docker logs --tail 200 ac-worldserver 2>&1)"
+    contains "$o" 'Unknown MySQL server host'
 }
 worldserver_db_ok() {      # 0 = the worldserver opened the database pool
-    docker logs --tail 200 ac-worldserver 2>&1 | grep -q "Opening DatabasePool 'acore_auth'" \
-        && ! worldserver_db_error
+    local o; o="$(docker logs --tail 200 ac-worldserver 2>&1)"
+    contains "$o" "Opening DatabasePool 'acore_auth'" && ! contains "$o" 'Unknown MySQL server host'
 }
 wait_for_db_connection() {  # <seconds> -> 0 = connected
     local max="${1:-300}" waited=0
@@ -241,7 +246,7 @@ if worldserver_db_error; then
 else
     ok "worldserver log has no name resolution error"
 fi
-printf 'world port %s: %s\n' "$WORLD_PORT" "$(ss -ltn 2>/dev/null | grep -q ":$WORLD_PORT " && echo open || echo closed)"
+printf 'world port %s: %s\n' "$WORLD_PORT" "$(port_open "$WORLD_PORT" && echo open || echo closed)"
 
 echo
 if [ "$DB_OK" = "1" ]; then

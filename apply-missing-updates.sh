@@ -40,19 +40,37 @@ WORLD_PORT="${WORLD_PORT:-8085}"
 #  discarded (/dev/null) and the port was polled in silence, so a blocked
 #  dependency or a crash loop looked like a frozen script. These helpers make
 #  the wait visible and print the container states + last log lines on failure.
-port_open()   { ss -ltn 2>/dev/null | grep -q ":$1 "; }
+#  WARNING: never use "cmd | grep -q" for a decision in this script. With
+#  `set -o pipefail` the early exit of grep makes the pipeline fail with SIGPIPE
+#  (141), so a log line that IS present looks like "not found" - the diagnostics
+#  stay silent and "World Initialized" is never detected. Every check therefore
+#  captures the output and matches it with a bash pattern, no pipeline involved.
+contains()    { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+port_open()   { local o; o="$(ss -ltn 2>/dev/null)"; contains "$o" ":$1 "; }
 ws_state()    { docker inspect -f '{{.State.Status}}' ac-worldserver 2>/dev/null || echo missing; }
 ws_restarts() { docker inspect -f '{{.RestartCount}}' ac-worldserver 2>/dev/null || echo 0; }
-ws_last_log() { docker logs --tail 1 ac-worldserver 2>&1 | tr -d '\r' | tail -c 90; }
+ws_log()      { docker logs --tail 300 ac-worldserver 2>&1; }
+ws_last_log() { local o; o="$(docker logs --tail 1 ac-worldserver 2>&1)"; printf '%s\n' "${o: -90}"; }
+ws_running() {   # 0 = the container exists and runs
+    local o n
+    o="$(docker ps --format '{{.Names}}' 2>/dev/null)"
+    for n in $o; do [ "$n" = 'ac-worldserver' ] && return 0; done
+    return 1
+}
 ws_up() {
-    docker logs --tail 300 ac-worldserver 2>&1 | grep -q 'World Initialized' && return 0
+    local o
+    o="$(ws_log)"
+    contains "$o" 'World Initialized' && return 0
     port_open "$WORLD_PORT" && return 0
     return 1
 }
 ws_dns_diag() {   # prints facts only when the database container cannot be resolved
-    docker logs --tail 300 ac-worldserver 2>&1 \
-        | grep -qE 'Unknown MySQL server host|Could not connect to MySQL' || return 0
-    local c rc
+    local log c rc
+    log="$(ws_log)"
+    if ! contains "$log" 'Unknown MySQL server host' \
+       && ! contains "$log" 'Could not connect to MySQL'; then
+        return 0
+    fi
     echo "  --- container DNS / network (ac-database is not resolvable) ---"
     for c in ac-worldserver ac-database; do
         rc="$(docker inspect -f '{{.ResolvConfPath}}' "$c" 2>/dev/null)"
@@ -231,7 +249,7 @@ done
 
 if [ "${DRY:-0}" = "1" ]; then
     echo "DRY-RUN: worldserver stays running, nothing will be applied"
-elif docker ps --format '{{.Names}}' | grep -qx ac-worldserver; then
+elif ws_running; then
     echo "Stopping worldserver ..."
     ( cd "$REPO" && docker compose stop ac-worldserver >/dev/null 2>&1 )
 fi
@@ -282,7 +300,7 @@ printf "  errors         : %s\n" "$FAILED"
 # therefore looked exactly like a frozen script. Now the output is kept, the wait
 # is limited to 5 minutes and a stack that does not come up is reported with its
 # container states and the last log lines instead of endless silence.
-if ! docker ps --format '{{.Names}}' | grep -qx ac-worldserver; then
+if ! ws_running; then
     echo "Starting worldserver ..."
     COMPOSE_LOG="/tmp/coa_compose_up_ac-worldserver.log"
     rc=0
