@@ -57,7 +57,8 @@ else
     # Drop the local build-fix change so the checkout can succeed
     # (the fix is re-applied automatically further down).
     FIXREL="modules/mod-ascension-compat/src/AscensionCompat.cpp"
-    git checkout -- "$FIXREL" 2>/dev/null || true
+    FIXREL2="modules/mod-ascension-compat/src/AscensionChronomancerMovement.cpp"
+    git checkout -- "$FIXREL" "$FIXREL2" 2>/dev/null || true
     if git checkout -B "$REPO_BRANCH" FETCH_HEAD >/dev/null 2>&1; then
         AFTER="$(git rev-parse HEAD)"
         ok "Repo updated: ${BEFORE:0:9} -> ${AFTER:0:9}"
@@ -69,17 +70,37 @@ else
     fi
 fi
 
-# Upstream bug: the fork removed SPELL_EFFECT_NONE from enum SpellEffects but
-# mod-ascension-compat still uses the name -> the build fails.
-# Value 0 equals SPELL_EFFECT_NONE.
-FIXFILE="modules/mod-ascension-compat/src/AscensionCompat.cpp"
+# Upstream build breakers in mod-ascension-compat (the module lags behind the
+# core API). Each fix is applied only while its pattern is still present.
+COMPAT="modules/mod-ascension-compat/src"
+
+# 1) SPELL_EFFECT_NONE was removed from enum SpellEffects; 0 is the same value.
+FIXFILE="$COMPAT/AscensionCompat.cpp"
 if [ -f "$FIXFILE" ] && grep -q 'SPELL_EFFECT_NONE' "$FIXFILE"; then
     sed -i 's/Effects\[EFFECT_2\]\.Effect = SPELL_EFFECT_NONE;/Effects[EFFECT_2].Effect = 0;/' "$FIXFILE"
     grep -q 'SPELL_EFFECT_NONE' "$FIXFILE" && die "Build fix failed: $FIXFILE"
     CODE_CHANGED=1
-    ok "Build fix re-applied (SPELL_EFFECT_NONE -> 0)"
+    ok "Build fix 1 re-applied (SPELL_EFFECT_NONE -> 0)"
 else
-    ok "Build fix not required"
+    ok "Build fix 1 not required (SPELL_EFFECT_NONE)"
+fi
+
+# 2) Unit::NearTeleportTo takes a non-const Position&, the module passes a temporary.
+FIXFILE2="$COMPAT/AscensionChronomancerMovement.cpp"
+if [ -f "$FIXFILE2" ] && grep -q 'NearTeleportTo(caster->GetNearPosition' "$FIXFILE2"; then
+    python3 - "$FIXFILE2" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); t = p.read_text()
+old = "        target->NearTeleportTo(caster->GetNearPosition(2.0f, 0.0f), true);"
+new = ("        {\n            Position dest = caster->GetNearPosition(2.0f, 0.0f);\n"
+       "            target->NearTeleportTo(dest, true);\n        }")
+p.write_text(t.replace(old, new))
+PYEOF
+    grep -q 'Position dest = caster->GetNearPosition' "$FIXFILE2" || die "Build fix failed: $FIXFILE2"
+    CODE_CHANGED=1
+    ok "Build fix 2 re-applied (NearTeleportTo temporary -> named Position)"
+else
+    ok "Build fix 2 not required (NearTeleportTo)"
 fi
 
 step "2/5  Database updates (core/module fixes)"

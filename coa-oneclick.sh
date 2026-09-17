@@ -162,8 +162,10 @@ fi
 step "2/9  Repository + build fix (mod-ascension-compat)"
 if [ -d "$AC_DIR/.git" ]; then
     git -C "$AC_DIR" fetch --prune origin "$REPO_BRANCH" >/dev/null 2>&1
-    # drop the local build-fix change so the checkout can succeed
-    git -C "$AC_DIR" checkout -- modules/mod-ascension-compat/src/AscensionCompat.cpp 2>/dev/null || true
+    # drop the local build-fix changes so the checkout can succeed
+    git -C "$AC_DIR" checkout -- \
+        modules/mod-ascension-compat/src/AscensionCompat.cpp \
+        modules/mod-ascension-compat/src/AscensionChronomancerMovement.cpp 2>/dev/null || true
     if git -C "$AC_DIR" checkout -B "$REPO_BRANCH" FETCH_HEAD >/dev/null 2>&1; then
         ok "Repo updated: $(git -C "$AC_DIR" rev-parse --short HEAD)"
     else
@@ -176,16 +178,35 @@ else
     ok "Repo cloned: $(git -C "$AC_DIR" rev-parse --short HEAD)"
 fi
 
-# Upstream bug: the fork removed SPELL_EFFECT_NONE from enum SpellEffects but
-# mod-ascension-compat still uses the name -> the build fails.
-# Value 0 equals SPELL_EFFECT_NONE.
-FIXFILE="$AC_DIR/modules/mod-ascension-compat/src/AscensionCompat.cpp"
+# Upstream build breakers in mod-ascension-compat (the module lags behind the
+# core API). Each fix is applied only while its pattern is still present.
+COMPAT="$AC_DIR/modules/mod-ascension-compat/src"
+
+# 1) SPELL_EFFECT_NONE was removed from enum SpellEffects; 0 is the same value.
+FIXFILE="$COMPAT/AscensionCompat.cpp"
 if [ -f "$FIXFILE" ] && grep -q 'SPELL_EFFECT_NONE' "$FIXFILE"; then
     sed -i 's/Effects\[EFFECT_2\]\.Effect = SPELL_EFFECT_NONE;/Effects[EFFECT_2].Effect = 0;/' "$FIXFILE"
     grep -q 'SPELL_EFFECT_NONE' "$FIXFILE" && die "Build fix failed: $FIXFILE"
-    ok "Build fix applied (SPELL_EFFECT_NONE -> 0)"
+    ok "Build fix 1 applied (SPELL_EFFECT_NONE -> 0)"
 else
-    ok "Build fix not required (already patched or fixed upstream)"
+    ok "Build fix 1 not required (SPELL_EFFECT_NONE)"
+fi
+
+# 2) Unit::NearTeleportTo takes a non-const Position&, the module passes a temporary.
+FIXFILE2="$COMPAT/AscensionChronomancerMovement.cpp"
+if [ -f "$FIXFILE2" ] && grep -q 'NearTeleportTo(caster->GetNearPosition' "$FIXFILE2"; then
+    python3 - "$FIXFILE2" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); t = p.read_text()
+old = "        target->NearTeleportTo(caster->GetNearPosition(2.0f, 0.0f), true);"
+new = ("        {\n            Position dest = caster->GetNearPosition(2.0f, 0.0f);\n"
+       "            target->NearTeleportTo(dest, true);\n        }")
+p.write_text(t.replace(old, new))
+PYEOF
+    grep -q 'Position dest = caster->GetNearPosition' "$FIXFILE2" || die "Build fix failed: $FIXFILE2"
+    ok "Build fix 2 applied (NearTeleportTo temporary -> named Position)"
+else
+    ok "Build fix 2 not required (NearTeleportTo)"
 fi
 
 # ------------------------------------------------------------ 3. Config
