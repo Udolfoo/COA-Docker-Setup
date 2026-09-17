@@ -42,6 +42,64 @@ cd "$AC_DIR" || die "Cannot enter $AC_DIR"
 
 DB_ROOT_PASSWORD="$(grep -E '^DOCKER_DB_ROOT_PASSWORD=' .env | head -1 | cut -d= -f2-)"
 [ -n "$DB_ROOT_PASSWORD" ] || die "DOCKER_DB_ROOT_PASSWORD not found in $AC_DIR/.env"
+# ---------------------------------------------------------------------------
+#  Worldserver helpers
+# ---------------------------------------------------------------------------
+#  "docker compose up" does not return before every depends_on condition is met
+#  (ac-database healthy, ac-db-import and ac-client-data-init completed) and it
+#  keeps waiting for a service that never becomes ready. Older versions piped
+#  that output into "tail" and then polled the port in complete silence, so a
+#  stuck or crash-looping stack looked exactly like a frozen script. These
+#  helpers make every wait visible and abort with the real log lines.
+port_open()   { ss -ltn 2>/dev/null | grep -q ":$1 "; }
+ws_state()    { docker inspect -f '{{.State.Status}}' ac-worldserver 2>/dev/null || echo missing; }
+ws_restarts() { docker inspect -f '{{.RestartCount}}' ac-worldserver 2>/dev/null || echo 0; }
+ws_last_log() { docker logs --tail 1 ac-worldserver 2>&1 | tr -d '\r' | tail -c 90; }
+ws_up() {
+    docker logs --tail 300 ac-worldserver 2>&1 | grep -q 'World Initialized' && return 0
+    port_open "$WORLD_PORT" && return 0
+    return 1
+}
+ws_diag() {
+    echo "      --- diagnostics ---"
+    docker ps -a --format '      {{.Names}}: {{.Status}}' 2>/dev/null \
+        | grep -E 'ac-(worldserver|authserver|database|db-import|client-data-init)' || true
+    echo "      last log lines of ac-worldserver:"
+    docker logs --tail 30 ac-worldserver 2>&1 | sed 's/^/        /' || true
+    echo "      details: docker logs ac-worldserver   /   df -h /"
+}
+ws_wait() {   # <max_seconds> -> 0 = up, 1 = not up (diagnostics printed)
+    local max="${1:-420}" waited=0 state restarts
+    while [ "$waited" -lt "$max" ]; do
+        if ws_up; then
+            printf "  Worldserver is up after %ss.\n" "$waited"
+            return 0
+        fi
+        state="$(ws_state)"
+        restarts="$(ws_restarts)"
+        case "$state" in
+            running|created|starting|paused) ;;
+            *)
+                printf "  Worldserver container state is '%s' after %ss - it did not start.\n" "$state" "$waited"
+                ws_diag
+                return 1 ;;
+        esac
+        if [ "${restarts:-0}" -gt 3 ] 2>/dev/null; then
+            printf "  Worldserver restarted %s times without coming up - crash loop.\n" "$restarts"
+            ws_diag
+            return 1
+        fi
+        if [ $((waited % 15)) -eq 0 ]; then
+            printf "  ... waiting %ss (state=%s restarts=%s) last log: %s\n" \
+                "$waited" "$state" "$restarts" "$(ws_last_log)"
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+    printf "  Worldserver did not come up within %ss.\n" "$max"
+    ws_diag
+    return 1
+}
 
 BEFORE="$(git rev-parse HEAD)"
 step "1/5  Repository: checking for updates"
@@ -141,29 +199,50 @@ else
 fi
 
 step "4/5  Restarting stack"
-docker compose up -d 2>&1 | tail -5
-log "Waiting for worldserver port ..."
-for _i in $(seq 1 80); do
-    ss -ltn 2>/dev/null | grep -q ":${WORLD_PORT} " && break
-    sleep 3
-done
+# "docker compose up -d" waits for ac-database to be healthy and for ac-db-import
+# and ac-client-data-init to complete. Its output is written to a log file
+# instead of "| tail -5" (tail prints nothing until the command has finished) and
+# the wait is limited, so a blocked dependency cannot freeze the update silently.
+COMPOSE_LOG="/tmp/coa_compose_up.log"
+rc=0
+(timeout 300 docker compose up -d) >"$COMPOSE_LOG" 2>&1 || rc=$?
+tail -6 "$COMPOSE_LOG" | sed 's/^/      /'
+if [ "$rc" -ne 0 ]; then
+    warn "docker compose up returned ${rc} (124 = 5 minute limit: a dependency never became ready)"
+    tail -20 "$COMPOSE_LOG" | sed 's/^/      /'
+fi
+
+log "Waiting for the worldserver (progress below, limit 7 minutes) ..."
+if ws_wait 420; then
+    ok "Worldserver is up"
+else
+    warn "Worldserver is NOT up - fix the cause shown above, then watch: docker logs -f ac-worldserver"
+fi
 
 # The core marks a realm offline when the worldserver stops and sets a
-# version-mismatch bit on startup. Both make the client show "Realm Offline".
+# version-mismatch bit on startup. Both make the client show "Realm Offline",
+# so the flag is cleared only once the world is really running - a start that
+# happens later would set the bits again.
 PW="${DB_ROOT_PASSWORD:-$(grep -E '^DOCKER_DB_ROOT_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2-)}"
-CUR_FLAG="$(docker exec -i ac-database mysql -uroot -p"$PW" acore_auth -N -B \
-    -e 'SELECT flag FROM realmlist WHERE id=1' 2>/dev/null | head -1)"
-if [ "${CUR_FLAG:-0}" != "0" ]; then
-    docker exec -i ac-database mysql -uroot -p"$PW" acore_auth \
-        -e 'UPDATE realmlist SET flag = flag & ~3 WHERE id=1' >/dev/null 2>&1
-    ok "Realm flag cleared (was ${CUR_FLAG}; offline/mismatch bits removed)"
+if ws_up; then
+    CUR_FLAG="$(docker exec -i ac-database mysql -uroot -p"$PW" acore_auth -N -B \
+        -e 'SELECT flag FROM realmlist WHERE id=1' 2>/dev/null | head -1)"
+    if [ "${CUR_FLAG:-0}" != "0" ]; then
+        docker exec -i ac-database mysql -uroot -p"$PW" acore_auth \
+            -e 'UPDATE realmlist SET flag = flag & ~3 WHERE id=1' >/dev/null 2>&1
+        ok "Realm flag cleared (was ${CUR_FLAG}; offline/mismatch bits removed)"
+    else
+        ok "Realm flag is 0 (online)"
+    fi
 else
-    ok "Realm flag is 0 (online)"
+    warn "Realm flag left untouched (worldserver not running) - it clears itself once the world is up"
 fi
 
 step "5/5  Status"
-docker ps --format '{{.Names}}: {{.Status}}'
+docker ps -a --format '{{.Names}}: {{.Status}}' | grep -E 'ac-' || true
 printf "Commit         : %s\n" "$(git rev-parse --short HEAD)"
+printf "Worldserver    : %s, port %s %s\n" "$(ws_state)" "$WORLD_PORT" \
+    "$(port_open "$WORLD_PORT" && echo open || echo closed)"
 printf "Item templates : %s\n" "$(docker exec -i ac-database mysql -uroot -p"$DB_ROOT_PASSWORD" acore_world -N -B -e 'SELECT COUNT(1) FROM item_template' 2>/dev/null | head -1)"
 printf "Errors in log  : %s\n" "$(docker logs --since 10m ac-worldserver 2>&1 | grep -ac -i error)"
 printf "Disk           : %s\n" "$(df -h / | awk 'NR==2 {print $4 " free (" $5 " used)"}')"

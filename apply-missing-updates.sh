@@ -30,6 +30,65 @@ REPO="${AC_DIR:-/opt/azerothcore}"
 LOG="/root/apply-missing-updates.log"
 
 exec > >(tee "$LOG") 2>&1
+WORLD_PORT="${WORLD_PORT:-8085}"
+
+# ---------------------------------------------------------------------------
+#  Worldserver helpers
+# ---------------------------------------------------------------------------
+#  "docker compose up -d ac-worldserver" waits for ac-database to be healthy
+#  and for ac-db-import / ac-client-data-init to finish. That output used to be
+#  discarded (/dev/null) and the port was polled in silence, so a blocked
+#  dependency or a crash loop looked like a frozen script. These helpers make
+#  the wait visible and print the container states + last log lines on failure.
+port_open()   { ss -ltn 2>/dev/null | grep -q ":$1 "; }
+ws_state()    { docker inspect -f '{{.State.Status}}' ac-worldserver 2>/dev/null || echo missing; }
+ws_restarts() { docker inspect -f '{{.RestartCount}}' ac-worldserver 2>/dev/null || echo 0; }
+ws_last_log() { docker logs --tail 1 ac-worldserver 2>&1 | tr -d '\r' | tail -c 90; }
+ws_up() {
+    docker logs --tail 300 ac-worldserver 2>&1 | grep -q 'World Initialized' && return 0
+    port_open "$WORLD_PORT" && return 0
+    return 1
+}
+ws_diag() {
+    echo "  --- diagnostics ---"
+    docker ps -a --format '  {{.Names}}: {{.Status}}' 2>/dev/null \
+        | grep -E 'ac-(worldserver|authserver|database|db-import|client-data-init)' || true
+    echo "  last log lines of ac-worldserver:"
+    docker logs --tail 30 ac-worldserver 2>&1 | sed 's/^/    /' || true
+    echo "  details: docker logs ac-worldserver   /   df -h /"
+}
+ws_wait() {   # <max_seconds> -> 0 = up, 1 = not up (diagnostics printed)
+    local max="${1:-420}" waited=0 state restarts
+    while [ "$waited" -lt "$max" ]; do
+        if ws_up; then
+            printf "  worldserver is up after %ss.\n" "$waited"
+            return 0
+        fi
+        state="$(ws_state)"
+        restarts="$(ws_restarts)"
+        case "$state" in
+            running|created|starting|paused) ;;
+            *)
+                printf "  worldserver container state is '%s' after %ss - it did not start.\n" "$state" "$waited"
+                ws_diag
+                return 1 ;;
+        esac
+        if [ "${restarts:-0}" -gt 3 ] 2>/dev/null; then
+            printf "  worldserver restarted %s times without coming up - crash loop.\n" "$restarts"
+            ws_diag
+            return 1
+        fi
+        if [ $((waited % 15)) -eq 0 ]; then
+            printf "  ... waiting for worldserver: %ss (state=%s restarts=%s) last log: %s\n" \
+                "$waited" "$state" "$restarts" "$(ws_last_log)"
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+    printf "  worldserver did not come up within %ss.\n" "$max"
+    ws_diag
+    return 1
+}
 
 echo "=== $(date '+%F %T') start ==="
 [ "${DRY:-0}" = "1" ] && echo "*** DRY-RUN: nothing is written to the databases ***"
@@ -194,13 +253,25 @@ printf "  hash updated   : %s\n" "$RECHASH"
 printf "  errors         : %s\n" "$FAILED"
 
 # --- 5) Start worldserver again ------------------------------------------
+# "docker compose up -d ac-worldserver" does not return before ac-database is
+# healthy and ac-db-import / ac-client-data-init have completed. That output used
+# to go to /dev/null while the port was polled in silence - a blocked dependency
+# therefore looked exactly like a frozen script. Now the output is kept, the wait
+# is limited to 5 minutes and a stack that does not come up is reported with its
+# container states and the last log lines instead of endless silence.
 if ! docker ps --format '{{.Names}}' | grep -qx ac-worldserver; then
     echo "Starting worldserver ..."
-    ( cd "$REPO" && docker compose up -d ac-worldserver >/dev/null 2>&1 )
-    for _i in $(seq 1 80); do
-        ss -ltn 2>/dev/null | grep -q ":8085 " && break
-        sleep 3
-    done
+    COMPOSE_LOG="/tmp/coa_compose_up_ac-worldserver.log"
+    rc=0
+    ( cd "$REPO" && timeout 300 docker compose up -d ac-worldserver ) >"$COMPOSE_LOG" 2>&1 || rc=$?
+    tail -6 "$COMPOSE_LOG" | sed 's/^/    /'
+    if [ "$rc" -ne 0 ]; then
+        echo "  docker compose up -d ac-worldserver returned ${rc} (124 = 5 minute limit: a dependency never became ready)"
+        tail -20 "$COMPOSE_LOG" | sed 's/^/    /'
+    fi
+else
+    echo "Worldserver container already running - waiting for it to finish loading."
 fi
-printf "Worldserver port 8085 active: %s\n" "$(ss -ltn 2>/dev/null | grep -c ':8085 ')"
+ws_wait 420 || true
+printf "Worldserver port %s active: %s\n" "$WORLD_PORT" "$(port_open "$WORLD_PORT" && echo yes || echo no)"
 echo "=== $(date '+%F %T') end ==="

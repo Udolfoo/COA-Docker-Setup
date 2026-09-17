@@ -144,9 +144,25 @@ What it does:
 2. If something changed: updates the repo, re-applies the build fix, **applies all missing
    SQL updates** for `acore_auth`, `acore_characters` and `acore_world`
 3. Rebuilds the docker images **only if the code changed** (or `FULL=1`)
-4. Frees old images (`docker image prune -f`), restarts the stack, prints a status report
+4. Frees old images (`docker image prune -f`), restarts the stack (with visible progress and
+   hard time limits) and prints a status report
 
 If nothing changed, the run finishes in seconds and only re-checks the database.
+
+### What happens while the worldserver restarts
+
+`docker compose up` does not return before `ac-database` is healthy and `ac-db-import` /
+`ac-client-data-init` have completed, and the worldserver needs a few minutes to load the
+CoA world data. So the scripts print a progress line every 15 seconds while waiting
+(`state=... restarts=...` plus the last worldserver log line) and use two safety limits:
+
+* `docker compose up` is limited to **5 minutes**
+* the worldserver start is limited to **7 minutes**
+
+If the stack does not come up, all `ac-*` container states plus the last 30 log lines are
+printed and the run continues with a clear `[WARN ]` – it never waits silently. The realm
+flag is cleared only once the world is really up, because a later start would set the
+offline/version-mismatch bits again (the client would show *Realm Offline*).
 
 `apply-missing-updates.sh` registers updates exactly like AzerothCore does
 (`name` = file name with `.sql`, `hash` = SHA1 in uppercase, `state` from the source folder:
@@ -218,6 +234,7 @@ The database root password lives in `/opt/azerothcore/.env`
 | Client cannot enter the realm / crashes | apply `patch_world_endpoint.py` (from the CoA fork repository) to `Extensions.dll` |
 | `unrar: Unsupported Method` | the archive is RAR5 / WinRAR 7 – the script installs RARLAB's `unrar`; alternatively provide a `.zip` |
 | Port 3306 already in use | `DB_EXTERNAL_PORT=127.0.0.1:13306` (the default) – only needed if a host MySQL/MariaDB runs |
+| `coa-update.sh` looks frozen after `Starting worldserver ...` | `docker compose up` is waiting for a dependency (`ac-database` healthy, `ac-db-import` / `ac-client-data-init` completed) or the worldserver is in a crash loop. Current scripts report progress every 15 s, stop after 5 / 7 minutes and print the `ac-*` container states plus the last 30 log lines. Older copies polled the port for 4 minutes without any output. Manual check: `cd /opt/azerothcore && docker compose ps -a`, `docker logs --tail 50 ac-worldserver`, `docker logs --tail 20 ac-client-data-init`, `df -h /` |
 | Vanity items: "has no AzerothCore item template yet" | CoA world data missing → import the CoA dump (`COA_WORLD_DUMP`) |
 
 ---
