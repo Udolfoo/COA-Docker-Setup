@@ -209,6 +209,8 @@ The database root password lives in `/opt/azerothcore/.env`
 | Symptom | Cause / fix |
 |---|---|
 | `Permission denied (publickey)` | install your SSH key on the server or use password login |
+| Build fails: `no matching member function for call to 'NearTeleportTo'` | upstream bug in mod-ascension-compat – the scripts patch it automatically, just re-run `bash coa-oneclick.sh` |
+| `Import failed (only 0 items in item_template)` | the base databases did not exist yet – run `cd /opt/azerothcore && docker compose up ac-db-import` once, then import the CoA dump again |
 | Build fails: `use of undeclared identifier 'SPELL_EFFECT_NONE'` | run `bash coa-oneclick.sh` again – it patches the line automatically |
 | Build fails: `E: Unable to locate package tzdata`, `Some index files failed to download` after ~240 s | the build container cannot reach the apt mirrors (broken IPv6 or a DNS stub) – run `bash fix-build-network.sh` (the deploy scripts call it automatically). Manual fix: pin Docker DNS (`/etc/docker/daemon.json` with `"dns": ["1.1.1.1","8.8.8.8"]`) and, if the host has no working IPv6, disable it (`net.ipv6.conf.all.disable_ipv6 = 1`) |
 | `docker compose up` fails on `ac-db-import ... exit 1` | the AC auto-updater tried to write into CoA data – `docker-compose.override.yml` must be present (the script creates it) |
@@ -217,6 +219,52 @@ The database root password lives in `/opt/azerothcore/.env`
 | `unrar: Unsupported Method` | the archive is RAR5 / WinRAR 7 – the script installs RARLAB's `unrar`; alternatively provide a `.zip` |
 | Port 3306 already in use | `DB_EXTERNAL_PORT=127.0.0.1:13306` (the default) – only needed if a host MySQL/MariaDB runs |
 | Vanity items: "has no AzerothCore item template yet" | CoA world data missing → import the CoA dump (`COA_WORLD_DUMP`) |
+
+---
+
+## Moving CoA content from an existing server
+
+Already running a CoA server elsewhere? Both data sets can be copied over the network.
+
+On the **old** server (serves the files over HTTP while the copy runs):
+
+```bash
+# tarball the client data and start a temporary web server
+VOL=/var/lib/docker/volumes/azerothcore_ac-client-data/_data
+cd "$VOL"
+for d in dbc maps vmaps mmaps Cameras; do tar -cf "/root/client-data-$d.tar" "$d"; done
+nohup python3 -m http.server 9999 --directory /root >/tmp/http9999.log 2>&1 &
+# stop it again when the copy is done:  pkill -f 'http.server 9999'
+```
+
+On the **new** server:
+
+```bash
+scp transfer-data.sh root@<NEW-SERVER>:/root/
+bash /root/transfer-data.sh <OLD-SERVER-IP> 9999
+```
+
+`transfer-data.sh` creates the Docker volume if needed, downloads the world dump
+(`databases.sql.gz` from `/root`) plus `dbc/maps/vmaps/mmaps/Cameras`, replaces
+the directories completely (mixing two data sets breaks the server), fixes the
+ownership to uid 1000 and writes the `data-version` marker so the
+`ac-client-data-init` container does not download anything again.
+
+Afterwards verify the DBC guard and import the world database:
+
+```bash
+python3 check-dbc-rows.py /var/lib/docker/volumes/azerothcore_ac-client-data/_data/dbc
+# -> 5/5 required rows present
+FORCE_IMPORT=1 COA_WORLD_DUMP=/root/databases.sql.gz bash coa-oneclick.sh
+```
+
+The base databases must exist before the CoA world dump is imported. If the
+first deployment failed with `Import failed (only 0 items in item_template)`,
+run the AzerothCore importer once:
+
+```bash
+cd /opt/azerothcore && docker compose up ac-db-import
+```
 
 ---
 
@@ -230,6 +278,8 @@ The database root password lives in `/opt/azerothcore/.env`
 | `check-repo-updates.sh` | read-only check: which repo updates are not registered yet |
 | `docker-compose.override.yml` | disables the auto-updater for CoA world data + log rotation |
 | `fix-build-network.sh` | repairs container DNS/IPv6 so image builds can reach the apt mirrors |
+| `transfer-data.sh` | copies the CoA world dump + client data from another server |
+| `check-dbc-rows.py` | verifies the CoA client DBC set the core requires (5 rows) |
 | `README.md` | this guide |
 
 ---

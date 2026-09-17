@@ -354,6 +354,16 @@ ok "ac-database healthy"
 
 if [ -n "$COA_WORLD_DUMP" ]; then
     [ -f "$COA_WORLD_DUMP" ] || die "COA_WORLD_DUMP not found: $COA_WORLD_DUMP"
+
+    # The AzerothCore importer creates acore_auth/characters/world with the base
+    # data. Without them the CoA dump has nowhere to go and the run would end
+    # with "Import failed (only 0 items in item_template)".
+    if [ "$(mysql_q "SELECT COUNT(1) FROM information_schema.tables WHERE table_schema='acore_world'" | head -1)" = "0" ]; then
+        log "Base databases missing -> running the AzerothCore importer once (a few minutes) ..."
+        docker compose up ac-db-import 2>&1 | tail -3
+        ok "Base databases created (auth/characters/world)"
+    fi
+
     ITEMS_NOW="$(world_items)"; ITEMS_NOW="${ITEMS_NOW:-0}"
     if [ "$ITEMS_NOW" -gt 400000 ] && [ "$FORCE_IMPORT" != "1" ]; then
         ok "CoA world already imported (${ITEMS_NOW} items) - import skipped (FORCE_IMPORT=1 forces it)"
