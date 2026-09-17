@@ -58,6 +58,9 @@ SWAP_SIZE="${SWAP_SIZE:-4G}"
 
 DATA_VOL="azerothcore_ac-client-data"
 
+# Directory this script lives in (needed for its helper scripts)
+SELF_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
 # ------------------------------------------------------------------ Helpers
 c_red='\033[0;31m'; c_grn='\033[0;32m'; c_yel='\033[1;33m'; c_blu='\033[0;36m'; c_off='\033[0m'
 log()  { printf "${c_blu}[INFO ]${c_off} %s\n" "$*"; }
@@ -127,13 +130,32 @@ if [ "$SKIP_SWAP" = "1" ]; then
 elif swapon --show 2>/dev/null | grep -q .; then
     ok "Swap already active: $(swapon --show --noheadings | head -1 | tr -s ' ')"
 else
-    log "Creating a ${SWAP_SIZE} swap file (protects the build from OOM)"
-    fallocate -l "$SWAP_SIZE" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
-    chmod 600 /swapfile
-    mkswap /swapfile >/dev/null
-    swapon /swapfile
-    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    ok "Swap active and added to /etc/fstab"
+    # mkswap/swapon ship with util-linux; minimal clouds images may not have it
+    if ! command -v mkswap >/dev/null 2>&1 || ! command -v swapon >/dev/null 2>&1; then
+        log "Installing util-linux (provides mkswap/swapon) ..."
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y --no-install-recommends util-linux >/dev/null 2>&1 || true
+    fi
+    if command -v mkswap >/dev/null 2>&1 && command -v swapon >/dev/null 2>&1; then
+        log "Creating a ${SWAP_SIZE} swap file (protects the build from OOM)"
+        if command -v fallocate >/dev/null 2>&1; then
+            fallocate -l "$SWAP_SIZE" /swapfile 2>/dev/null \
+                || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
+        else
+            dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
+        fi
+        chmod 600 /swapfile
+        if mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile 2>/dev/null \
+           && swapon --show 2>/dev/null | grep -q /swapfile; then
+            grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            ok "Swap active ($(swapon --show --noheadings | head -1 | tr -s ' ')) and added to /etc/fstab"
+        else
+            rm -f /swapfile
+            warn "Swap could not be created - continuing without it (fine with enough RAM)"
+        fi
+    else
+        warn "mkswap/swapon unavailable - continuing without swap (fine with enough RAM)"
+    fi
 fi
 
 # ------------------------------------------------- 2. Repo + build fix
@@ -307,8 +329,6 @@ done
 [ "$(docker inspect --format '{{.State.Health.Status}}' ac-database 2>/dev/null)" = "healthy" ] \
     || die "ac-database does not become healthy (see: docker logs ac-database)"
 ok "ac-database healthy"
-
-SELF_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 if [ -n "$COA_WORLD_DUMP" ]; then
     [ -f "$COA_WORLD_DUMP" ] || die "COA_WORLD_DUMP not found: $COA_WORLD_DUMP"
