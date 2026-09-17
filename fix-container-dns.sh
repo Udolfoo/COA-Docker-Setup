@@ -55,6 +55,17 @@ info() { printf '\033[0;36m[INFO ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN ]\033[0m %s\n' "$*"; }
 fail() { printf '\033[0;31m[FAIL ]\033[0m %s\n' "$*"; }
 step() { printf '\n\033[0;36m=== %s ===\033[0m\n' "$*"; }
+# ------------------------------------------------------------------- checks
+[ "$(id -u)" -eq 0 ] || { fail "please run as root (sudo bash $0)"; exit 1; }
+command -v docker >/dev/null 2>&1 || { fail "docker is not installed"; exit 1; }
+[ -f "$AC_DIR/docker-compose.yml" ] || { fail "no deployment found at $AC_DIR"; exit 1; }
+command -v python3 >/dev/null 2>&1 || warn "python3 not found - a custom dns entry in daemon.json cannot be edited"
+[ "$DRY" = "1" ] && info "DRY-RUN: nothing will be changed"
+
+# image for the throwaway probe container: the one ac-database already uses, so
+# nothing has to be downloaded (fallback only if it cannot be inspected)
+DB_IMAGE="$(docker inspect -f '{{.Config.Image}}' ac-database 2>/dev/null)"
+[ -n "$DB_IMAGE" ] || DB_IMAGE="mysql:8.4"
 contains()    { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 port_open()   { local o; o="$(ss -ltn 2>/dev/null)"; contains "$o" ":$1 "; }
 state_of()   { docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null || echo missing; }
@@ -98,10 +109,10 @@ print('dns entry removed, kept keys: ' + keys)
 PYEOF
 }
 probe_resolve() {   # <network> -> 0 = ac-database resolves, 1 = no, 2 = not testable
-    local net="$1" out rc
+    local net="$1" out rc img="${DB_IMAGE:-mysql:8.4}"
     [ -n "$net" ] || return 2
     command -v timeout >/dev/null 2>&1 || return 2
-    out="$(timeout 60 docker run --rm --network "$net" --entrypoint /bin/sh "$DB_IMAGE" \
+    out="$(timeout 60 docker run --rm --network "$net" --entrypoint /bin/sh "$img" \
             -c 'getent hosts ac-database' 2>&1)"
     rc=$?
     printf '%s\n' "$out" > /tmp/coa_dns_probe.txt
@@ -110,8 +121,16 @@ probe_resolve() {   # <network> -> 0 = ac-database resolves, 1 = no, 2 = not tes
     return 1
 }
 probe_worldserver_networks() {   # 0 = a container next to ac-worldserver resolves ac-database
-    local n
-    for n in $(net_names ac-worldserver); do
+    local n nets
+    nets="$(net_names ac-worldserver)"
+    if [ -z "${nets// /}" ]; then
+        # a restarting container reports no networks in inspect - the network of
+        # ac-database is the same one, so probe that instead of reporting a false
+        # "does not resolve"
+        info "ac-worldserver is currently $(state_of ac-worldserver) and reports no network - probing the network of ac-database"
+        nets="$(net_names ac-database)"
+    fi
+    for n in $nets; do
         probe_resolve "$n" && return 0
     done
     return 1
@@ -168,36 +187,71 @@ case "$PROBE" in
     *) warn "probe not possible (no timeout, or no shell in $DB_IMAGE) - repairing anyway" ;;
 esac
 
+# ------------------------------------------------------------ repair helpers
+compose_recreate() {   # <timeout> <logfile>
+    local t="${1:-600}" log="${2:-/tmp/coa_compose_recreate.log}" rc=0
+    ( cd "$AC_DIR" && timeout "$t" docker compose up -d --force-recreate ) >"$log" 2>&1 || rc=$?
+    tail -6 "$log" | sed 's/^/      /'
+    [ "$rc" -eq 0 ] || warn "docker compose up --force-recreate returned ${rc} (124 = ${t}s limit) - log: $log"
+    return 0
+}
+compose_restart_app() {
+    ( cd "$AC_DIR" && timeout 180 docker compose restart ac-worldserver ac-authserver ) 2>&1 | tail -3 | sed 's/^/      /'
+}
+clean_daemon_dns() {   # remove the dns key (backup kept) and restart the daemon
+    cp -f /etc/docker/daemon.json /etc/docker/daemon.json.bak-dns 2>/dev/null || true
+    if command -v python3 >/dev/null 2>&1 && strip_daemon_json_dns; then
+        ok "dns entry removed (backup: /etc/docker/daemon.json.bak-dns)"
+    else
+        warn "daemon.json left untouched - check it: cat /etc/docker/daemon.json"
+    fi
+    info "restarting the Docker daemon ..."
+    timeout 120 systemctl restart docker >/dev/null 2>&1 || warn "systemctl restart docker timed out"
+    for _i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+}
+
 # ------------------------------------------------------------------ 3) repair
 step "3/5  Repair"
 DB_OK=0
 if [ "$DRY" = "1" ]; then
-    if [ "$PROBE" = "0" ]; then
+    if ! has_embedded_dns ac-worldserver; then
+        info "would recreate the stack (ac-worldserver has no 127.0.0.11 in its resolv.conf)"
+        [ -n "$(daemon_json_dns)" ] && info "would remove the dns entry from daemon.json and restart Docker first"
+    elif [ "$PROBE" = "0" ]; then
         info "would run: docker compose restart ac-worldserver ac-authserver"
     else
         info "would run: docker compose up -d --force-recreate"
     fi
 elif [ "$SKIP_REPAIR" = "1" ]; then
     warn "SKIP_REPAIR=1 - nothing is changed"
+elif ! has_embedded_dns ac-worldserver; then
+    # the case seen in the field: the container was created while daemon.json
+    # carried a custom "dns" entry, so its resolv.conf holds only that server -
+    # the embedded resolver 127.0.0.11, which answers the compose service names,
+    # is missing. It resolves external names but never 'ac-database'.
+    # A restart does not help here (the resolver config stays), the container has
+    # to be created again - after cleaning up the cause.
+    warn "ac-worldserver has no 127.0.0.11 in its resolv.conf (resolves external names only)"
+    if [ -n "$(daemon_json_dns)" ]; then
+        warn "cause: daemon.json sets $(daemon_json_dns) - every container created after that gets no embedded resolver"
+        clean_daemon_dns
+    else
+        info "no custom dns entry found - recreating the containers with a fresh resolver config"
+    fi
+    compose_recreate 600
 elif [ "$PROBE" = "0" ]; then
     info "the name resolves on the network - only the container of the worldserver is stale"
     info "restarting ac-worldserver and ac-authserver ..."
-    ( cd "$AC_DIR" && timeout 180 docker compose restart ac-worldserver ac-authserver ) 2>&1 | tail -3 | sed 's/^/      /'
+    compose_restart_app
 else
     info "the name does not resolve on the network - recreating the stack"
     info "(same network, fresh resolver config, re-registered DNS aliases)"
-    LOG=/tmp/coa_compose_recreate.log
-    rc=0
-    ( cd "$AC_DIR" && timeout 600 docker compose up -d --force-recreate ) >"$LOG" 2>&1 || rc=$?
-    tail -6 "$LOG" | sed 's/^/      /'
-    [ "$rc" -eq 0 ] || warn "docker compose up --force-recreate returned ${rc} (124 = the 10 minute limit)"
+    compose_recreate 600
 fi
 
 if [ "$DRY" != "1" ] && [ "$SKIP_REPAIR" != "1" ]; then
     info "waiting for the worldserver to reach the database ..."
-    if wait_for_db_connection 240; then
-        DB_OK=1
-    fi
+    wait_for_db_connection 240 && DB_OK=1
 fi
 
 # -------------------------------------------------------------- 4) escalation
@@ -206,23 +260,12 @@ if [ "$DRY" != "1" ] && [ "$SKIP_REPAIR" != "1" ] && [ "$DB_OK" = "0" ]; then
     if [ "$MAX_STEP" -lt 2 ] 2>/dev/null; then
         warn "MAX_STEP=1 - escalation skipped"
     elif [ -n "$(daemon_json_dns)" ]; then
-        warn "still failing - a custom dns entry is present, cleaning it up"
-        info "the entry: $(daemon_json_dns)   (it is only needed for image builds)"
-        cp -f /etc/docker/daemon.json /etc/docker/daemon.json.bak-dns 2>/dev/null || true
-        if command -v python3 >/dev/null 2>&1 && strip_daemon_json_dns; then
-            ok "dns entry removed (backup: /etc/docker/daemon.json.bak-dns)"
-        else
-            warn "daemon.json left untouched - check it: cat /etc/docker/daemon.json"
-        fi
-        info "restarting the Docker daemon ..."
-        timeout 120 systemctl restart docker >/dev/null 2>&1 || warn "systemctl restart docker timed out"
-        for _i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
-        info "recreating the stack ..."
-        ( cd "$AC_DIR" && timeout 600 docker compose up -d --force-recreate ) >/tmp/coa_compose_recreate.log 2>&1 \
-            || warn "docker compose up --force-recreate returned an error - log: /tmp/coa_compose_recreate.log"
+        warn "still failing - cleaning up the custom dns entry and restarting Docker"
+        clean_daemon_dns
+        compose_recreate 600
         wait_for_db_connection 300 && DB_OK=1
     else
-        info "no custom dns entry in daemon.json - nothing left to escalate to"
+        info "no custom dns entry left - nothing to escalate to"
     fi
 fi
 
@@ -262,12 +305,3 @@ warn "  docker inspect -f '{{json .NetworkSettings.Networks}}' ac-worldserver ac
 warn "  docker inspect -f '{{.ResolvConfPath}}' ac-worldserver | xargs cat"
 warn "  journalctl -u docker --since '30 min ago' | tail -30"
 exit 1
-
-[ "$(id -u)" -eq 0 ] || { fail "please run as root (sudo bash $0)"; exit 1; }
-command -v docker >/dev/null 2>&1 || { fail "docker is not installed"; exit 1; }
-[ -f "$AC_DIR/docker-compose.yml" ] || { fail "no deployment found at $AC_DIR"; exit 1; }
-command -v python3 >/dev/null 2>&1 || warn "python3 not found - a custom dns entry in daemon.json cannot be edited"
-[ "$DRY" = "1" ] && info "DRY-RUN: nothing will be changed"
-
-DB_IMAGE="$(docker inspect -f '{{.Config.Image}}' ac-database 2>/dev/null)"
-[ -n "$DB_IMAGE" ] || DB_IMAGE="mysql:8.4"
