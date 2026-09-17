@@ -38,10 +38,17 @@ restart_docker() {
     sleep 5
 }
 
-host_resolvers() {  # host upstream resolvers, loopback stubs removed
-    cat /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null \
-        | sed -n 's/^nameserver[[:space:]]*//p' \
-        | grep -v '^127\.' | sort -u | head -3
+host_resolvers() {  # host upstream resolvers, robust for systemd-resolved per-link DNS
+    #  resolvectl dns   ->  "Link 3 (eno1): 213.186.33.99 2001:db8::1"
+    #  /run/systemd/resolve/resolv.conf and /etc/resolv.conf as fallbacks
+    {
+        resolvectl dns 2>/dev/null | sed -n 's/.*: //p'
+        sed -n 's/^nameserver[[:space:]]*//p' /run/systemd/resolve/resolv.conf 2>/dev/null
+        sed -n 's/^nameserver[[:space:]]*//p' /etc/resolv.conf 2>/dev/null
+    } | tr ' ' '\n' \
+      | grep -E '^[0-9a-fA-F:.]+$' \
+      | grep -v '^127\.' | grep -v '^::1$' | grep -v '^0\.0\.0\.0$' \
+      | sort -u | head -3
 }
 
 [ "$(id -u)" -eq 0 ] || { fail "please run as root (sudo bash $0)"; exit 1; }
