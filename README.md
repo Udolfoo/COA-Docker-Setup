@@ -210,6 +210,7 @@ The database root password lives in `/opt/azerothcore/.env`
 |---|---|
 | `Permission denied (publickey)` | install your SSH key on the server or use password login |
 | Build fails: `use of undeclared identifier 'SPELL_EFFECT_NONE'` | run `bash coa-oneclick.sh` again – it patches the line automatically |
+| Build fails: `E: Unable to locate package tzdata`, `Some index files failed to download` after ~240 s | the build container cannot reach the apt mirrors (broken IPv6 or a DNS stub) – run `bash fix-build-network.sh` (the deploy scripts call it automatically). Manual fix: pin Docker DNS (`/etc/docker/daemon.json` with `"dns": ["1.1.1.1","8.8.8.8"]`) and, if the host has no working IPv6, disable it (`net.ipv6.conf.all.disable_ipv6 = 1`) |
 | `docker compose up` fails on `ac-db-import ... exit 1` | the AC auto-updater tried to write into CoA data – `docker-compose.override.yml` must be present (the script creates it) |
 | Client log: "malformed packet" | the client sends plaintext world headers – apply `AscensionCompat.AllowRemoteClients = 1` (script) **and** patch `Extensions.dll` |
 | Client cannot enter the realm / crashes | apply `patch_world_endpoint.py` (from the CoA fork repository) to `Extensions.dll` |
@@ -228,6 +229,7 @@ The database root password lives in `/opt/azerothcore/.env`
 | `apply-missing-updates.sh` | applies repo SQL updates to auth/characters/world (SHA1 + state exactly like AC) |
 | `check-repo-updates.sh` | read-only check: which repo updates are not registered yet |
 | `docker-compose.override.yml` | disables the auto-updater for CoA world data + log rotation |
+| `fix-build-network.sh` | repairs container DNS/IPv6 so image builds can reach the apt mirrors |
 | `README.md` | this guide |
 
 ---

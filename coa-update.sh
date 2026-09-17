@@ -96,8 +96,19 @@ fi
 
 step "3/5  Docker images"
 if [ "$CODE_CHANGED" = "1" ] || [ "$FULL" = "1" ]; then
+    # Network preflight: a fresh VPS can fail here because a build container
+    # cannot reach the apt mirrors (broken IPv6 or container DNS stub).
+    if [ -f "$SCRIPT_DIR/fix-build-network.sh" ]; then
+        bash "$SCRIPT_DIR/fix-build-network.sh" \
+            || warn "Network preflight reported a problem - trying the build anyway"
+    fi
     log "Building images (30-120 minutes) ..."
-    docker compose build || die "Image build failed"
+    if ! docker compose build; then
+        warn "Build failed - retrying once (transient mirror/network problems)"
+        sleep 10
+        docker compose build \
+            || die "Image build failed (see README troubleshooting: apt/DNS/IPv6)"
+    fi
     ok "Images rebuilt"
     # Free old images + cap the build cache (prevents the disk filling up over time)
     docker image prune -f >/dev/null 2>&1 || true

@@ -273,8 +273,19 @@ NEED_BUILD=1
 if docker image inspect "acore/ac-wotlk-worldserver:${IMAGE_TAG}" >/dev/null 2>&1; then NEED_BUILD=0; fi
 [ "$FORCE_BUILD" = "1" ] && NEED_BUILD=1
 if [ "$NEED_BUILD" = "1" ]; then
+    # Network preflight: on a fresh VPS the build often fails because a container
+    # cannot reach the apt mirrors (broken IPv6 or container DNS stub).
+    if [ -f "$SELF_DIR/fix-build-network.sh" ]; then
+        bash "$SELF_DIR/fix-build-network.sh" \
+            || warn "Network preflight reported a problem - trying the build anyway"
+    fi
     log "docker compose build (30-120 minutes)"
-    docker compose build || die "Image build failed"
+    if ! docker compose build; then
+        warn "Build failed - retrying once (transient mirror/network problems)"
+        sleep 10
+        docker compose build \
+            || die "Image build failed (see README troubleshooting: apt/DNS/IPv6)"
+    fi
     ok "Images built (tag: ${IMAGE_TAG})"
     docker image prune -f >/dev/null 2>&1 || true
     docker builder prune -f --keep-storage 8GB >/dev/null 2>&1 || true
