@@ -211,13 +211,16 @@ The database root password lives in `/opt/azerothcore/.env`
   automatically (value `0` equals `SPELL_EFFECT_NONE`). If upstream fixes it, nothing happens.
 * **Your dump is only used partially:** only the `acore_world` section of a full mysqldump is
   imported, so accounts and characters on the target server stay untouched.
-* **A custom `dns` entry in `/etc/docker/daemon.json`** can end up in the containers instead of
-  Docker's embedded resolver `127.0.0.11`. The compose service names (`ac-database`, `ac-authserver`)
-  then no longer resolve and the worldserver stops with
-  `Unknown MySQL server host 'ac-database' (-3)`. `fix-build-network.sh` uses that entry to make
-  **builds** reach the apt mirrors; if the stack was recreated afterwards, run
-  `bash /root/fix-container-dns.sh` (it removes the entry, keeps `/etc/docker/daemon.json.bak-dns`
-  and recreates the containers).
+* **After a Docker daemon restart** (`fix-build-network.sh`, `fix-resolv.sh`, a package update) the
+  network sandbox and the DNS alias registration of already running containers can become stale.
+  Such a container no longer resolves its peers: the worldserver then restarts in a loop with
+  `Could not connect to MySQL database at ac-database: Unknown MySQL server host 'ac-database' (-3)`
+  (MySQL error `-3` = `CR_UNKNOWN_HOST`). Nothing is damaged – `docker compose up -d --force-recreate`
+  (or `bash /root/fix-container-dns.sh`) puts every container back on the same network with a fresh
+  resolver configuration; accounts, characters and the CoA world data stay in the Docker volumes.
+  Docker normally gives each container the embedded resolver `127.0.0.11`, which answers the
+  compose service names – a custom `"dns"` entry in `/etc/docker/daemon.json` only changes which
+  servers that resolver forwards *external* lookups to.
 * **Backups & logs:** `acore_world_old` (world before the import, drop it when you are happy),
   `/root/updates_backup_acore_*.sql` (overwritten on every run), `/root/coa-deploy.log`,
   `/root/apply-missing-updates.log`.
@@ -243,7 +246,7 @@ The database root password lives in `/opt/azerothcore/.env`
 | `unrar: Unsupported Method` | the archive is RAR5 / WinRAR 7 – the script installs RARLAB's `unrar`; alternatively provide a `.zip` |
 | Port 3306 already in use | `DB_EXTERNAL_PORT=127.0.0.1:13306` (the default) – only needed if a host MySQL/MariaDB runs |
 | `coa-update.sh` looks frozen after `Starting worldserver ...` | `docker compose up` is waiting for a dependency (`ac-database` healthy, `ac-db-import` / `ac-client-data-init` completed) or the worldserver is in a crash loop. Current scripts report progress every 15 s, stop after 5 / 7 minutes and print the `ac-*` container states plus the last 30 log lines. Older copies polled the port for 4 minutes without any output. Manual check: `cd /opt/azerothcore && docker compose ps -a`, `docker logs --tail 50 ac-worldserver`, `docker logs --tail 20 ac-client-data-init`, `df -h /` |
-| Worldserver restart loop, log: `Could not connect to MySQL database at ac-database: Unknown MySQL server host 'ac-database' (-3)` + `DatabasePool Login NOT opened` | The container cannot resolve the compose service name – it uses a custom DNS server instead of Docker's embedded resolver `127.0.0.11`, or it is not attached to the network of `ac-database`. Run `bash /root/fix-container-dns.sh`: it prints the facts (resolv.conf, networks, aliases), removes a custom `"dns"` entry from `/etc/docker/daemon.json` (backup kept), restarts the Docker daemon and recreates the stack. Data stays in the volumes. A recreated stack also picks up the change, see `docker-compose.override.yml` |
+| Worldserver restart loop, log: `Could not connect to MySQL database at ac-database: Unknown MySQL server host 'ac-database' (-3)` + `DatabasePool Login NOT opened` | MySQL error `-3` is `CR_UNKNOWN_HOST`, so the container cannot resolve the compose service name – **no database or image damage**. Run `bash /root/fix-container-dns.sh`: it prints the facts (resolv.conf, networks, DNS aliases, `daemon.json`), probes the name with a throwaway container in the same network and then applies the smallest fix – restart the application containers, or recreate the stack so all containers share one network with a fresh resolver configuration and re-registered DNS aliases. Only if that is not enough does it remove a custom `"dns"` entry from `/etc/docker/daemon.json` (backup kept) and restart the Docker daemon. Data stays in the volumes. |
 | Vanity items: "has no AzerothCore item template yet" | CoA world data missing → import the CoA dump (`COA_WORLD_DUMP`) |
 
 ---
