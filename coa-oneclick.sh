@@ -296,8 +296,9 @@ if docker image inspect "acore/ac-wotlk-worldserver:${IMAGE_TAG}" >/dev/null 2>&
 [ "$FORCE_BUILD" = "1" ] && NEED_BUILD=1
 if [ "$NEED_BUILD" = "1" ]; then
     # Network preflight: on a fresh VPS the build often fails because a container
-    # cannot reach the apt mirrors (broken IPv6 or container DNS stub).
+    # cannot reach the apt mirrors (broken IPv6 or a DNS stub). Takes up to ~2 min.
     if [ -f "$SELF_DIR/fix-build-network.sh" ]; then
+        log "Network preflight: checking container DNS/IPv6 (max ~2 minutes) ..."
         bash "$SELF_DIR/fix-build-network.sh" \
             || warn "Network preflight reported a problem - trying the build anyway"
     fi

@@ -97,8 +97,9 @@ fi
 step "3/5  Docker images"
 if [ "$CODE_CHANGED" = "1" ] || [ "$FULL" = "1" ]; then
     # Network preflight: a fresh VPS can fail here because a build container
-    # cannot reach the apt mirrors (broken IPv6 or container DNS stub).
+    # cannot reach the apt mirrors (broken IPv6 or a DNS stub). Max ~2 minutes.
     if [ -f "$SCRIPT_DIR/fix-build-network.sh" ]; then
+        log "Network preflight: checking container DNS/IPv6 (max ~2 minutes) ..."
         bash "$SCRIPT_DIR/fix-build-network.sh" \
             || warn "Network preflight reported a problem - trying the build anyway"
     fi
