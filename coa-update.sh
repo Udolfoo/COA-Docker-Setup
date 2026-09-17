@@ -148,6 +148,19 @@ for _i in $(seq 1 80); do
     sleep 3
 done
 
+# The core marks a realm offline when the worldserver stops and sets a
+# version-mismatch bit on startup. Both make the client show "Realm Offline".
+PW="${DB_ROOT_PASSWORD:-$(grep -E '^DOCKER_DB_ROOT_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2-)}"
+CUR_FLAG="$(docker exec -i ac-database mysql -uroot -p"$PW" acore_auth -N -B \
+    -e 'SELECT flag FROM realmlist WHERE id=1' 2>/dev/null | head -1)"
+if [ "${CUR_FLAG:-0}" != "0" ]; then
+    docker exec -i ac-database mysql -uroot -p"$PW" acore_auth \
+        -e 'UPDATE realmlist SET flag = flag & ~3 WHERE id=1' >/dev/null 2>&1
+    ok "Realm flag cleared (was ${CUR_FLAG}; offline/mismatch bits removed)"
+else
+    ok "Realm flag is 0 (online)"
+fi
+
 step "5/5  Status"
 docker ps --format '{{.Names}}: {{.Status}}'
 printf "Commit         : %s\n" "$(git rev-parse --short HEAD)"

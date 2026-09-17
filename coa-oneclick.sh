@@ -536,6 +536,17 @@ else
     warn "Public IP not detected - set it manually (PUBLIC_IP=<ip>)"
 fi
 
+# The core marks a realm offline when the worldserver stops and sets a
+# version-mismatch bit on startup. Both make the client show "Realm Offline",
+# so clear them once the worldserver is up.
+CUR_FLAG="$(mysql_q "SELECT flag FROM realmlist WHERE id=1" acore_auth | head -1)"
+if [ "${CUR_FLAG:-0}" != "0" ]; then
+    mysql_q "UPDATE realmlist SET flag = flag & ~3 WHERE id=1" acore_auth >/dev/null 2>&1
+    ok "Realm flag cleared (was ${CUR_FLAG}; offline/mismatch bits removed)"
+else
+    ok "Realm flag is 0 (online)"
+fi
+
 # ------------------------------------------------------- 9. GM + summary
 step "9/9  Summary"
 if [ -n "$GM_ACCOUNT" ]; then
