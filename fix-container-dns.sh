@@ -300,6 +300,10 @@ if [ "$DB_OK" = "1" ]; then
     info "the client shows 'Realm Offline' until the realm flag is cleared: bash /root/coa-update.sh"
     exit 0
 fi
+if [ "$DRY" = "1" ] || [ "$SKIP_REPAIR" = "1" ]; then
+    info "nothing was changed (DRY=1 / SKIP_REPAIR=1) - the checks above show the current state"
+    exit 0
+fi
 warn "Not repaired automatically. Please send the output of:"
 warn "  docker inspect -f '{{json .NetworkSettings.Networks}}' ac-worldserver ac-database"
 warn "  docker inspect -f '{{.ResolvConfPath}}' ac-worldserver | xargs cat"

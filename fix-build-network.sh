@@ -31,6 +31,7 @@ TEST_IMAGE="${TEST_IMAGE:-ubuntu:24.04}"
 TEST_TIMEOUT="${TEST_TIMEOUT:-45}"
 DRY="${DRY:-0}"
 SKIP_IPV6_FIX="${SKIP_IPV6_FIX:-0}"
+AC_DIR="${AC_DIR:-/opt/azerothcore}"
 CHANGED=0
 APT_RC=2
 
@@ -201,9 +202,9 @@ fi
 
 # ------------------------------------------------------------------- repair
 if [ "$NEED_DNS" = "1" ]; then
-    # Root cause: /etc/resolv.conf points at the loopback stub. `docker run`
-    # can be helped through daemon.json, but BuildKit copies that file verbatim
-    # into build containers, so it must be usable as well.
+    # Root cause: /etc/resolv.conf points at the loopback stub. The fix belongs on
+    # the host - BuildKit copies /etc/resolv.conf verbatim into build containers,
+    # so that file has to be usable there.
     if grep -q '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null \
        && ! grep -q '^nameserver 127\.' /run/systemd/resolve/resolv.conf; then
         if [ "$DRY" = "1" ]; then
@@ -215,14 +216,46 @@ if [ "$NEED_DNS" = "1" ]; then
             CHANGED=1
         fi
     else
-        warn "no usable uplink resolv.conf found - fixing the Docker DNS only"
+        warn "no usable uplink resolv.conf found - check the host resolver manually"
     fi
 
-    RESOLVERS="$(host_resolvers | tr '\n' ' ' | sed 's/ *$//')"
-    [ -n "$RESOLVERS" ] || RESOLVERS="1.1.1.1 8.8.8.8"
+    # A global "dns" entry in daemon.json is deliberately NOT written any more.
+    # It replaces the embedded resolver 127.0.0.11 in every container that is
+    # created afterwards - and that resolver is what answers the compose service
+    # names (ac-database, ac-authserver). Observed failure:
+    #   Could not connect to MySQL database at ac-database:
+    #   Unknown MySQL server host 'ac-database' (-3)   + worldserver restart loop
+    # The containers get their working DNS from the host resolv.conf repaired
+    # above, which is enough for image builds and for the running stack.
     if [ -f /etc/docker/daemon.json ] && grep -q '"dns"' /etc/docker/daemon.json 2>/dev/null; then
-        info "/etc/docker/daemon.json already sets dns - leaving it untouched"
-    else
+        warn "/etc/docker/daemon.json sets a global dns - that breaks the compose service names"
+        warn "   containers created afterwards lose 127.0.0.11 and cannot resolve ac-database"
+        if [ "${REMOVE_GLOBAL_DNS:-0}" = "1" ]; then
+            if [ "$DRY" = "1" ]; then
+                info "would remove the dns entry (backup: /etc/docker/daemon.json.bak-dns)"
+            elif command -v python3 >/dev/null 2>&1; then
+                cp -f /etc/docker/daemon.json /etc/docker/daemon.json.bak-dns 2>/dev/null || true
+                python3 - <<'PYEOF'
+import json, pathlib
+p = pathlib.Path('/etc/docker/daemon.json')
+data = json.loads(p.read_text() or '{}')
+data.pop('dns', None)
+p.write_text(json.dumps(data, indent=2) + '\n')
+print('kept keys: ' + (', '.join(sorted(data)) or 'none'))
+PYEOF
+                ok "dns entry removed (backup: /etc/docker/daemon.json.bak-dns)"
+                CHANGED=1
+            else
+                warn "python3 missing - edit /etc/docker/daemon.json manually"
+            fi
+            info "recreate the containers afterwards: cd $AC_DIR && docker compose up -d --force-recreate"
+        else
+            info "remove it with: REMOVE_GLOBAL_DNS=1 bash $0   (or: bash fix-container-dns.sh)"
+        fi
+    elif [ "${ALLOW_GLOBAL_DNS:-0}" = "1" ]; then
+        # opt-in only, and merged into the file instead of overwriting it
+        RESOLVERS="$(host_resolvers | tr '\n' ' ' | sed 's/ *$//')"
+        [ -n "$RESOLVERS" ] || RESOLVERS="1.1.1.1 8.8.8.8"
         IFS=' ' read -r -a DNS_LIST <<< "$RESOLVERS"
         DNS_JSON=""
         for d in "${DNS_LIST[@]}"; do
@@ -230,15 +263,30 @@ if [ "$NEED_DNS" = "1" ]; then
             DNS_JSON="$DNS_JSON\"$d\""
         done
         if [ "$DRY" = "1" ]; then
-            info "would set the Docker DNS servers to [$DNS_JSON]"
-        else
+            info "would merge dns=[$DNS_JSON] into /etc/docker/daemon.json (ALLOW_GLOBAL_DNS=1)"
+        elif command -v python3 >/dev/null 2>&1; then
             [ -f /etc/docker/daemon.json ] && cp -f /etc/docker/daemon.json /etc/docker/daemon.json.bak
-            info "setting the Docker DNS servers to [$DNS_JSON]"
-            printf '{\n  "dns": [%s]\n}\n' "$DNS_JSON" > /etc/docker/daemon.json
+            DNS_JSON="$DNS_JSON" python3 - <<'PYEOF'
+import json, os, pathlib
+p = pathlib.Path('/etc/docker/daemon.json')
+data = json.loads(p.read_text() or '{}') if p.exists() else {}
+data['dns'] = [x.strip() for x in os.environ['DNS_JSON'].split(',') if x.strip()]
+p.write_text(json.dumps(data, indent=2) + '\n')
+print('daemon.json keys: ' + ', '.join(sorted(data)))
+PYEOF
+            warn "dns merged into daemon.json - recreate the containers afterwards, otherwise the"
+            warn "running stack keeps its old resolver config: cd $AC_DIR && docker compose up -d --force-recreate"
             CHANGED=1
+        else
+            warn "python3 missing - cannot merge daemon.json"
         fi
+    else
+        info "no global dns entry needed - containers use the host resolv.conf plus the embedded 127.0.0.11"
     fi
-    restart_docker
+
+    if [ "$CHANGED" = "1" ]; then
+        restart_docker
+    fi
 fi
 
 if [ "$NEED_NFT" = "1" ]; then
