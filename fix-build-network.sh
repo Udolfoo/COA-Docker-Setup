@@ -8,131 +8,167 @@
 #     E: Unable to locate package tzdata
 #     W: Some index files failed to download (after ~240 s)
 #
-#  Cause: the container resolves the mirror to an IPv6 address but has no
-#  working IPv6 route, so apt waits for the connection to time out. A second
-#  cause is a DNS server that is not reachable from inside the container.
+#  Cause 1 - DNS: many servers use systemd-resolved, so /etc/resolv.conf only
+#    holds the stub 127.0.0.53. Docker drops loopback resolvers and falls back
+#    to 8.8.8.8, which some providers filter (e.g. OVH). The real upstream
+#    (e.g. 213.186.33.99) is only visible through `resolvectl`.
+#  Cause 2 - IPv6: apt resolves an IPv6 mirror address but the host has no
+#    IPv6 route, so every package list waits for the connection timeout.
 #
-#  It uses the resolvers the host already uses - never hardcoded public ones,
-#  because some providers filter third party resolvers (e.g. OVH).
+#  Never pulls an image and never blocks: everything is timeout-guarded.
 #
-#  Usage:  bash fix-build-network.sh          # diagnose, repair, verify
-#          TEST_TIMEOUT=30 bash fix-build-network.sh   # shorter tests
+#  Usage:  bash fix-build-network.sh          # check, repair what is broken
+#          DRY=1 bash fix-build-network.sh    # report only, change nothing
+#          SKIP_IPV6_FIX=1 bash fix-build-network.sh
+#          TEST_IMAGE=debian:12 bash fix-build-network.sh   # container test image
 # ===========================================================================
 set -uo pipefail
 
 TEST_IMAGE="${TEST_IMAGE:-ubuntu:24.04}"
-TEST_TIMEOUT="${TEST_TIMEOUT:-60}"          # seconds per connectivity test
+TEST_TIMEOUT="${TEST_TIMEOUT:-45}"
+DRY="${DRY:-0}"
+SKIP_IPV6_FIX="${SKIP_IPV6_FIX:-0}"
+CHANGED=0
+
 ok()   { printf '\033[0;32m[ OK  ]\033[0m %s\n' "$*"; }
 info() { printf '\033[0;36m[INFO ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN ]\033[0m %s\n' "$*"; }
 fail() { printf '\033[0;31m[FAIL ]\033[0m %s\n' "$*"; }
 
-apt_works() {  # can a fresh container run apt-get update?
-    timeout "$TEST_TIMEOUT" docker run --rm "$TEST_IMAGE" \
-        sh -c 'apt-get update -qq >/dev/null 2>&1' >/dev/null 2>&1
-}
+[ "$(id -u)" -eq 0 ] || { fail "please run as root (sudo bash $0)"; exit 1; }
+command -v docker >/dev/null 2>&1 || { fail "docker is not installed"; exit 1; }
+[ "$DRY" = "1" ] && info "DRY-RUN: nothing will be changed"
 
-restart_docker() {
-    info "restarting the Docker daemon (a few seconds) ..."
-    timeout 90 systemctl restart docker >/dev/null 2>&1 || warn "docker restart timed out"
-    sleep 5
-}
-
-host_resolvers() {  # host upstream resolvers, robust for systemd-resolved per-link DNS
-    #  resolvectl dns   ->  "Link 3 (eno1): 213.186.33.99 2001:db8::1"
-    #  /run/systemd/resolve/resolv.conf and /etc/resolv.conf as fallbacks
+host_resolvers() {  # host upstream resolvers (resolvectl knows per-link DNS)
     {
         resolvectl dns 2>/dev/null | sed -n 's/.*: //p'
         sed -n 's/^nameserver[[:space:]]*//p' /run/systemd/resolve/resolv.conf 2>/dev/null
         sed -n 's/^nameserver[[:space:]]*//p' /etc/resolv.conf 2>/dev/null
     } | tr ' ' '\n' \
-      | grep -E '^[0-9a-fA-F:.]+$' \
+      | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9a-fA-F:]+$' \
       | grep -v '^127\.' | grep -v '^::1$' | grep -v '^0\.0\.0\.0$' \
       | sort -u | head -3
 }
 
-[ "$(id -u)" -eq 0 ] || { fail "please run as root (sudo bash $0)"; exit 1; }
-command -v docker >/dev/null 2>&1 || { fail "docker is not installed"; exit 1; }
+stub_only_resolv_conf() {  # does /etc/resolv.conf contain nothing but loopback?
+    local ns
+    ns="$(sed -n 's/^nameserver[[:space:]]*//p' /etc/resolv.conf 2>/dev/null)"
+    [ -n "$ns" ] || return 1
+    ! printf '%s\n' "$ns" | grep -qv '^127\.'
+}
 
-info "checking whether a build container can reach the apt mirrors (max ${TEST_TIMEOUT}s) ..."
-if apt_works; then
-    ok "apt works inside containers - nothing to fix"
-    exit 0
-fi
-warn "apt-get update fails inside a container - repairing"
+restart_docker() {
+    if [ "$DRY" = "1" ]; then
+        info "would restart the Docker daemon"
+        return 0
+    fi
+    info "restarting the Docker daemon (a few seconds) ..."
+    timeout 90 systemctl restart docker >/dev/null 2>&1 || warn "docker restart timed out"
+    sleep 4
+}
+
+ipv6_usable() {
+    [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = "0" ] || return 1
+    timeout 8 curl -6 -sI http://archive.ubuntu.com/ >/dev/null 2>&1
+}
+
+have_image() { docker image inspect "$1" >/dev/null 2>&1; }
+
+container_apt_test() {  # 0 = works, 1 = fails, 2 = not testable (no local image)
+    have_image "$TEST_IMAGE" || return 2
+    local out=/tmp/coa_apt_test.log attempt rc=1
+    for attempt in 1 2; do
+        info "apt-get update inside a container (attempt $attempt, max ${TEST_TIMEOUT}s) ..."
+        timeout "$TEST_TIMEOUT" docker run --rm "$TEST_IMAGE" \
+            sh -c 'apt-get update -qq' > "$out" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        sleep 2
+    done
+    warn "container apt test failed (rc=$rc) - last output:"
+    tail -3 "$out" 2>/dev/null | sed 's/^/        /'
+    return 1
+}
+
+# ---------------------------------------------------------------- diagnosis
 info "host resolvers: $(host_resolvers | tr '\n' ' ')"
 
-# --- 1) DNS ---------------------------------------------------------------
-RESOLVERS="$(host_resolvers | tr '\n' ' ')"
-[ -n "${RESOLVERS// /}" ] || RESOLVERS="1.1.1.1 8.8.8.8"
+if stub_only_resolv_conf; then
+    warn "/etc/resolv.conf only holds the systemd-resolved stub (127.0.0.53)"
+    info "-> Docker would fall back to 8.8.8.8, which some providers filter"
+else
+    ok "/etc/resolv.conf lists real resolvers"
+fi
 
-if [ -f /etc/docker/daemon.json ]; then
-    if grep -q '"dns"' /etc/docker/daemon.json 2>/dev/null; then
+if ipv6_usable; then
+    ok "IPv6 is usable"
+else
+    warn "IPv6 is not usable (no route, although addresses may resolve)"
+    info "-> apt would wait for the connection timeout on every package list"
+fi
+
+container_apt_test
+APT_RC=$?
+case "$APT_RC" in
+    0) ok "apt works inside a container - the build should work" ;;
+    2) warn "test image $TEST_IMAGE is not present locally - skipping the container test"
+       info "the build itself is the real check; the fixes below use the evidence above" ;;
+    *) warn "apt-get update fails inside a container" ;;
+esac
+
+# ------------------------------------------------------------------- repair
+if stub_only_resolv_conf; then
+    RESOLVERS="$(host_resolvers | tr '\n' ' ' | sed 's/ *$//')"
+    [ -n "$RESOLVERS" ] || RESOLVERS="1.1.1.1 8.8.8.8"
+    if [ -f /etc/docker/daemon.json ] && grep -q '"dns"' /etc/docker/daemon.json 2>/dev/null; then
         info "/etc/docker/daemon.json already sets dns - leaving it untouched"
-        DNS_DONE=1
     else
-        info "/etc/docker/daemon.json exists without dns - backing it up and adding dns"
-        cp -f /etc/docker/daemon.json /etc/docker/daemon.json.bak 2>/dev/null || true
-        DNS_DONE=0
+        IFS=' ' read -r -a DNS_LIST <<< "$RESOLVERS"
+        DNS_JSON=""
+        for d in "${DNS_LIST[@]}"; do
+            [ -n "$DNS_JSON" ] && DNS_JSON="$DNS_JSON, "
+            DNS_JSON="$DNS_JSON\"$d\""
+        done
+        if [ "$DRY" = "1" ]; then
+            info "would set the Docker DNS servers to [$DNS_JSON] in /etc/docker/daemon.json"
+        else
+            [ -f /etc/docker/daemon.json ] && cp -f /etc/docker/daemon.json /etc/docker/daemon.json.bak
+            info "setting the Docker DNS servers to [$DNS_JSON]"
+            printf '{\n  "dns": [%s]\n}\n' "$DNS_JSON" > /etc/docker/daemon.json
+            CHANGED=1
+            restart_docker
+        fi
     fi
-else
-    DNS_DONE=0
 fi
 
-if [ "$DNS_DONE" = "0" ]; then
-    IFS=' ' read -r -a DNS_LIST <<< "$RESOLVERS"
-    DNS_JSON=""
-    for d in "${DNS_LIST[@]}"; do
-        [ -n "$DNS_JSON" ] && DNS_JSON="$DNS_JSON, "
-        DNS_JSON="$DNS_JSON\"$d\""
-    done
-    info "writing /etc/docker/daemon.json with dns = [$DNS_JSON]"
-    printf '{\n  "dns": [%s]\n}\n' "$DNS_JSON" > /etc/docker/daemon.json
-    restart_docker
-    info "testing again (max ${TEST_TIMEOUT}s) ..."
-    if apt_works; then
-        ok "fixed by setting the Docker DNS servers"
-        exit 0
+if ! ipv6_usable && [ "$SKIP_IPV6_FIX" != "1" ]; then
+    if [ "$DRY" = "1" ]; then
+        info "would disable IPv6 so apt uses IPv4 immediately (sysctl + /etc/sysctl.d/99-no-ipv6.conf)"
+    else
+        info "disabling IPv6 so apt uses IPv4 immediately"
+        echo "net.ipv6.conf.all.disable_ipv6 = 1" > /etc/sysctl.d/99-no-ipv6.conf
+        sysctl -q -w net.ipv6.conf.all.disable_ipv6=1
+        CHANGED=1
+        restart_docker
     fi
-    warn "the DNS servers did not help - removing them again"
-    mv /etc/docker/daemon.json /etc/docker/daemon.json.rejected 2>/dev/null \
-        || rm -f /etc/docker/daemon.json
-    restart_docker
+elif ! ipv6_usable; then
+    warn "IPv6 is not usable but SKIP_IPV6_FIX=1 - not touching it"
 fi
 
-# --- 2) IPv6 without connectivity: disable it so apt uses IPv4 at once ----
-IPV6_USABLE=0
-if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = "0" ] \
-   && timeout 10 curl -6 -sI http://archive.ubuntu.com/ >/dev/null 2>&1; then
-    IPV6_USABLE=1
+# ------------------------------------------------------------------ verdict
+if [ "$CHANGED" = "1" ] && [ "$DRY" != "1" ]; then
+    container_apt_test
+    case "$?" in
+        0) ok "repaired - apt works inside a container now" ;;
+        2) ok "repairs applied; verify them with the build (no local test image)" ;;
+        *) warn "still failing - see the hints below" ;;
+    esac
 fi
 
-if [ "$IPV6_USABLE" = "0" ]; then
-    info "IPv6 is not usable -> disabling it so apt uses IPv4 immediately"
-    echo "net.ipv6.conf.all.disable_ipv6 = 1" > /etc/sysctl.d/99-no-ipv6.conf
-    sysctl -q -w net.ipv6.conf.all.disable_ipv6=1
-    restart_docker
-    info "testing again (max ${TEST_TIMEOUT}s) ..."
-    if apt_works; then
-        ok "fixed by disabling IPv6"
-        exit 0
-    fi
-else
-    ok "IPv6 works - not touching it"
-fi
-
-# --- 3) Last resort: does it work with the host network namespace? --------
-info "trying the same test with --network=host (max ${TEST_TIMEOUT}s) ..."
-if timeout "$TEST_TIMEOUT" docker run --rm --network=host "$TEST_IMAGE" \
-        sh -c 'apt-get update -qq >/dev/null 2>&1'; then
-    ok "works with --network=host"
-    info "add 'network: host' to the build section of docker-compose.yml"
-    info "or build manually with:  docker build --network=host"
-    exit 0
-fi
-
-fail "still failing - the host itself cannot reach the apt mirrors"
-info "check with:   curl -sI http://archive.ubuntu.com/ubuntu/ | head -1"
-info "provider DNS: resolvectl status 2>/dev/null || cat /etc/resolv.conf"
-info "behind a proxy? export HTTP_PROXY/HTTPS_PROXY and add \"proxies\" to /etc/docker/daemon.json"
-exit 1
+info "manual checks:"
+info "  host:      curl -sI http://archive.ubuntu.com/ubuntu/ | head -1"
+info "  container: docker run --rm $TEST_IMAGE sh -c 'cat /etc/resolv.conf'"
+info "  provider:  resolvectl dns | grep -v ':\$'"
+info "  IPv6:      curl -6 -sI http://archive.ubuntu.com/ | head -1   (empty/hanging = broken)"
+info "  proxy?     export HTTP_PROXY/HTTPS_PROXY and add \"proxies\" to /etc/docker/daemon.json"
+exit 0
