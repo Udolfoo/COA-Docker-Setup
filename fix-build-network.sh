@@ -78,6 +78,65 @@ fw_forward_info() {  # FORWARD policy + number of Docker rules
     echo "policy=${pol:-unknown} dockerRules=${rules}"
 }
 
+nft_forward_drop() {  # 0 = an nftables forward chain drops everything (docker broken)
+    command -v nft >/dev/null 2>&1 || return 1
+    nft list ruleset 2>/dev/null | awk '
+        /chain [^ ]*forward/ { fwd=1; pol=0; rules=0; next }
+        /chain /             { fwd=0; pol=0; rules=0; next }
+        fwd && /policy drop/ { pol=1; next }
+        fwd && /^[[:space:]]*\}/ {
+            if (pol && rules == 0) print "empty-drop"
+            fwd=0; pol=0; rules=0; next }
+        fwd && /(accept|jump|return|drop|reject|log)/ { rules++; next }
+    ' | grep -q empty-drop
+}
+
+nft_fw_fix_runtime() {  # allow container forwarding in the running ruleset
+    nft add rule inet filter forward iifname "docker0" accept
+    nft add rule inet filter forward oifname "docker0" accept
+    nft add rule inet filter forward iifname "br-*" accept
+    nft add rule inet filter forward oifname "br-*" accept
+    nft add rule inet filter forward iifname "veth*" accept
+    nft add rule inet filter forward oifname "veth*" accept
+}
+
+nft_fw_fix_persist() {  # add the same rules to /etc/nftables.conf (survives reboot)
+    local conf=/etc/nftables.conf
+    [ -f "$conf" ] || return 0
+    grep -q docker0 "$conf" && { info "already present in $conf"; return 0; }
+    cp -f "$conf" "$conf.bak"
+    awk '
+        { lines[NR] = $0 }
+        END {
+            start = 0
+            for (i = 1; i <= NR; i++)
+                if (lines[i] ~ /chain .*forward/ && start == 0) start = i
+            end = 0
+            if (start > 0)
+                for (i = start + 1; i <= NR; i++)
+                    if (lines[i] ~ /^[[:space:]]*}/ && end == 0) { end = i; break }
+            for (i = 1; i <= NR; i++) {
+                if (end > 0 && i == end) {
+                    print "        # Docker/Containers: sonst wird der gesamte Container-Verkehr (inkl. DNS) verworfen"
+                    print "        iifname \"docker0\" accept"
+                    print "        oifname \"docker0\" accept"
+                    print "        iifname \"br-*\" accept"
+                    print "        oifname \"br-*\" accept"
+                    print "        iifname \"veth*\" accept"
+                    print "        oifname \"veth*\" accept"
+                }
+                print lines[i]
+            }
+        }' "$conf.bak" > "$conf"
+    if nft -c -f "$conf" >/dev/null 2>&1; then
+        ok "added docker rules to $conf (backup: $conf.bak)"
+        systemctl reload-or-restart nftables >/dev/null 2>&1 || true
+    else
+        warn "the patched $conf has a syntax error - restoring the backup"
+        mv -f "$conf.bak" "$conf"
+    fi
+}
+
 restart_docker() {
     if [ "$DRY" = "1" ]; then
         info "would restart the Docker daemon"
@@ -133,8 +192,32 @@ else
     info "-> apt waits for the connection timeout on every package list"
 fi
 
+NEED_NFT=0
+if nft_forward_drop; then
+    NEED_NFT=1
+    warn "an nftables forward chain drops everything (policy drop, no rules)"
+    info "-> build containers have no internet at all; DNS and apt hang instead of failing"
+fi
+
 # ------------------------------------------------------------------- repair
 if [ "$NEED_DNS" = "1" ]; then
+    # Root cause: /etc/resolv.conf points at the loopback stub. `docker run`
+    # can be helped through daemon.json, but BuildKit copies that file verbatim
+    # into build containers, so it must be usable as well.
+    if grep -q '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null \
+       && ! grep -q '^nameserver 127\.' /run/systemd/resolve/resolv.conf; then
+        if [ "$DRY" = "1" ]; then
+            info "would link /etc/resolv.conf -> /run/systemd/resolve/resolv.conf"
+        else
+            cp -f /etc/resolv.conf /etc/resolv.conf.stub-backup 2>/dev/null || true
+            ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+            ok "linked /etc/resolv.conf -> /run/systemd/resolve/resolv.conf (backup: .stub-backup)"
+            CHANGED=1
+        fi
+    else
+        warn "no usable uplink resolv.conf found - fixing the Docker DNS only"
+    fi
+
     RESOLVERS="$(host_resolvers | tr '\n' ' ' | sed 's/ *$//')"
     [ -n "$RESOLVERS" ] || RESOLVERS="1.1.1.1 8.8.8.8"
     if [ -f /etc/docker/daemon.json ] && grep -q '"dns"' /etc/docker/daemon.json 2>/dev/null; then
@@ -153,8 +236,19 @@ if [ "$NEED_DNS" = "1" ]; then
             info "setting the Docker DNS servers to [$DNS_JSON]"
             printf '{\n  "dns": [%s]\n}\n' "$DNS_JSON" > /etc/docker/daemon.json
             CHANGED=1
-            restart_docker
         fi
+    fi
+    restart_docker
+fi
+
+if [ "$NEED_NFT" = "1" ]; then
+    if [ "$DRY" = "1" ]; then
+        info "would allow docker0/br-*/veth* in the nftables forward chain (runtime + /etc/nftables.conf)"
+    else
+        info "allowing container forwarding in nftables"
+        nft_fw_fix_runtime
+        nft_fw_fix_persist
+        CHANGED=1
     fi
 fi
 
