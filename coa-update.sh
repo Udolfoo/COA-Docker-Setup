@@ -99,8 +99,8 @@ if [ "$CODE_CHANGED" = "1" ] || [ "$FULL" = "1" ]; then
     # Network preflight: a fresh VPS can fail here because a build container
     # cannot reach the apt mirrors (broken IPv6 or a DNS stub). Max ~2 minutes.
     if [ -f "$SCRIPT_DIR/fix-build-network.sh" ]; then
-        log "Network preflight: checking container DNS/IPv6 (max ~2 minutes) ..."
-        bash "$SCRIPT_DIR/fix-build-network.sh" \
+        log "Network preflight: checking container DNS/IPv6 (hard limit 5 minutes) ..."
+        timeout 300 bash "$SCRIPT_DIR/fix-build-network.sh" \
             || warn "Network preflight reported a problem - trying the build anyway"
     fi
     log "Building images (30-120 minutes) ..."
