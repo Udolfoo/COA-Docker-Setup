@@ -11,6 +11,7 @@
 #    data/sql/custom/db_<db>          -> <db>  CUSTOM     (apply pass 2)
 #    data/sql/updates/pending_db_<db> -> <db>  PENDING    (apply pass 2)
 #    modules/*/data/sql/db-<db>       -> <db>  MODULE     (apply pass 2)
+#    patches/db-<db>                  -> <db>  MODULE     (apply pass 2)
 #  (data/sql/manual/ and *.sh are ignored - these are manual tools)
 #
 #  Application order mirrors UpdateFetcher::Update():
@@ -26,6 +27,7 @@ set -uo pipefail
 
 PW="${DB_ROOT_PASSWORD:-$(grep -E '^DOCKER_DB_ROOT_PASSWORD=' /opt/azerothcore/.env 2>/dev/null | head -1 | cut -d= -f2-)}"
 [ -n "$PW" ] || { echo "DB password not found (set DB_ROOT_PASSWORD)"; exit 1; }
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO="${AC_DIR:-/opt/azerothcore}"
 LOG="/root/apply-missing-updates.log"
 
@@ -170,6 +172,14 @@ while IFS= read -r mdir; do
     esac
 done < <(find "$REPO/modules" -type d \
             \( -name db-auth -o -name db-characters -o -name db-world \) 2>/dev/null)
+
+# Project patches: SQL shipped with this deployment repo in patches/db-<db>/.
+# Needed when upstream ships code that reads a table without shipping the SQL
+# (example: creature_display_preset, commit e8f9afcc5). Registered like MODULE
+# updates, so a changed file is re-applied and re-hashed.
+for db in auth characters world; do
+    collect MODULE "acore_$db" "$SCRIPT_DIR/patches/db-$db"
+done
 
 # --- 1b) Order exactly like AzerothCore's UpdateFetcher::Update() ----------
 #   pass 1: RELEASED + ARCHIVED       - sorted byte-wise by file name

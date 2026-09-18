@@ -221,6 +221,12 @@ The database root password lives in `/opt/azerothcore/.env`
   Docker normally gives each container the embedded resolver `127.0.0.11`, which answers the
   compose service names – a custom `"dns"` entry in `/etc/docker/daemon.json` only changes which
   servers that resolver forwards *external* lookups to.
+* **Missing table after a core update** (e.g. `[1146] Table 'acore_world.creature_display_preset'
+  doesn't exist` → `>> ABORTED`): upstream sometimes ships module code that reads a table without
+  shipping the SQL. Such SQL belongs in `patches/db-<db>/*.sql` next to these scripts –
+  `apply-missing-updates.sh` picks it up automatically (state `MODULE`, registered with its SHA1)
+  and `coa-update.sh` / `coa-oneclick.sh` apply it for you. Shipped patches: `creature_display_preset`
+  (commit `e8f9afcc5`). The table may stay empty, the mirror-image NPCs then use their default display.
 * **Backups & logs:** `acore_world_old` (world before the import, drop it when you are happy),
   `/root/updates_backup_acore_*.sql` (overwritten on every run), `/root/coa-deploy.log`,
   `/root/apply-missing-updates.log`.
@@ -309,6 +315,7 @@ cd /opt/azerothcore && docker compose up ac-db-import
 | `fix-build-network.sh` | repairs container DNS/IPv6 so image builds can reach the apt mirrors |
 | `fix-container-dns.sh` | repairs container DNS/network when the worldserver cannot resolve `ac-database` (error -3) |
 | `check-db-access.sh` | read-only check: databases, MySQL users and a real login over the compose network |
+| `patches/db-<db>/*.sql` | project patches for tables the core/module code needs but upstream never shipped as SQL |
 | `transfer-data.sh` | copies the CoA world dump + client data from another server |
 | `check-dbc-rows.py` | verifies the CoA client DBC set the core requires (5 rows) |
 | `README.md` | this guide |
@@ -327,6 +334,7 @@ the repository is reconciled against the databases, so that all commits after th
 | `data/sql/custom/db_<db>` | CUSTOM | pass 2 |
 | `data/sql/updates/pending_db_<db>` | PENDING | pass 2 |
 | `modules/*/data/sql/db-<db>` | MODULE | pass 2 |
+| `patches/db-<db>` (next to the scripts) | MODULE | pass 2 |
 
 `<db>` is `auth`, `characters` or `world` – each is routed to `acore_auth`, `acore_characters` or
 `acore_world`. This is exactly what AzerothCore does: the directories come from the table
