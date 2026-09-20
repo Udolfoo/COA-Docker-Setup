@@ -277,6 +277,18 @@ else
     ok "No code change -> images unchanged (FULL=1 forces a rebuild)"
 fi
 
+# Configs: a core/module update can add modules and config keys. A module whose
+# <name>.conf was never copied from its .conf.dist is not configured at all and
+# logs "Config: Missing property <KEY>" on EVERY read (tens of thousands of log
+# lines per day, burying real errors) - so repair that before the restart below.
+if [ "${SKIP_CONFIG_FIX:-0}" != "1" ] && [ -f "$SCRIPT_DIR/fix-config-warnings.py" ]; then
+    step "3b/5  Config warnings (module configs)"
+    python3 "$SCRIPT_DIR/fix-config-warnings.py" --no-restart --ac-dir "$AC_DIR" \
+        || warn "config fix reported a problem - run it alone to see the details"
+else
+    log "config fix skipped (SKIP_CONFIG_FIX=1 or fix-config-warnings.py missing)"
+fi
+
 step "4/5  Restarting stack"
 # "docker compose up -d" waits for ac-database to be healthy and for ac-db-import
 # and ac-client-data-init to complete. Its output is written to a log file
@@ -324,6 +336,8 @@ printf "Worldserver    : %s, port %s %s\n" "$(ws_state)" "$WORLD_PORT" \
     "$(port_open "$WORLD_PORT" && echo open || echo closed)"
 printf "Item templates : %s\n" "$(docker exec -i ac-database mysql -uroot -p"$DB_ROOT_PASSWORD" acore_world -N -B -e 'SELECT COUNT(1) FROM item_template' 2>/dev/null | head -1)"
 printf "Errors in log  : %s\n" "$(docker logs --since 10m ac-worldserver 2>&1 | grep -ac -i error)"
+printf "Config warnings: %s (Missing property / Duplicate key, last 10 min - see fix-config-warnings.py)\n" \
+    "$(docker logs --since 10m ac-worldserver 2>&1 | grep -a -c -e 'Missing property' -e 'Duplicate key name')"
 printf "Disk           : %s\n" "$(df -h / | awk 'NR==2 {print $4 " free (" $5 " used)"}')"
 echo
 ok "Update finished. Live log: docker logs -f ac-worldserver"

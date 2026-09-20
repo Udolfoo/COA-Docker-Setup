@@ -495,6 +495,16 @@ fi
 # to the log - on every read, which is tens of thousands of lines per day. So do
 # not list three modules here (that is exactly how mod-coa-challenges and
 # mod-dynamic-xp were missed and flooded the log) - activate every template.
+# Module configs: the script pulls the templates from the image, activates every
+# missing <module>.conf and removes duplicate keys from worldserver.conf. A
+# missing module config logs one "Config: Missing property" line per key read -
+# tens of thousands per day, which buries real errors.
+if [ -f "$SELF_DIR/fix-config-warnings.py" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$SELF_DIR/fix-config-warnings.py" --no-restart --ac-dir "$AC_DIR" \
+        || warn "config fix reported a problem (see the output above)"
+else
+    warn "fix-config-warnings.py or python3 missing - only the basic step below runs"
+fi
 for dist in "$ETC"/modules/*.conf.dist; do
     if [ ! -e "$dist" ]; then
         warn "No module config templates found in $ETC/modules"
