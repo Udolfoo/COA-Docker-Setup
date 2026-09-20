@@ -147,9 +147,16 @@ What it does:
 
 1. **Checks for updates** (`git fetch`, compares local vs. remote) and prints the new commits
 2. If something changed: updates the repo, re-applies the build fix, **applies all missing
-   SQL updates** for `acore_auth`, `acore_characters` and `acore_world`
+   SQL updates** for `acore_auth`, `acore_characters`, `acore_world` (and `acore_playerbots`
+   when the bot module is installed)
 3. Rebuilds the docker images **only if the code changed** (or `FULL=1`)
-4. Frees old images (`docker image prune -f`), restarts the stack (with visible progress and
+4. **Repairs the module configs** (`fix-config-warnings.py --no-restart`, skip with
+   `SKIP_CONFIG_FIX=1`): a core update that adds a module ships a new `<module>.conf.dist`
+   whose keys would otherwise be logged as `Config: Missing property` on every read (see the
+   troubleshooting table – the fork added `mod-craftsmans-codex`, `mod-ethereal-bazaar`,
+   `mod-spellbook`, ... over time, and each one needs its `craftsmans_codex.conf`,
+   `ethereal_bazaar.conf`, `spellbook.conf`, ... activated)
+5. Frees old images (`docker image prune -f`), restarts the stack (with visible progress and
    hard time limits) and prints a status report
 
 If nothing changed, the run finishes in seconds and only re-checks the database.
