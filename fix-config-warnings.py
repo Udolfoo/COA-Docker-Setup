@@ -45,10 +45,14 @@ Usage:
     sudo python3 fix-config-warnings.py
     sudo python3 fix-config-warnings.py --dry-run      # report only
     sudo python3 fix-config-warnings.py --no-restart   # edit, do not restart
+    sudo python3 fix-config-warnings.py --wait 300     # longer wait for the world load
 
-Options: --etc PATH --ac-dir PATH --wait SECONDS
+Options: --etc PATH --ac-dir PATH --wait SECONDS (default 60)
          coa-oneclick.sh / coa-update.sh call this script with --no-restart
          (they restart the stack themselves).
+
+The script writes the configuration BEFORE it waits, so a start that takes
+longer than --wait only means "check later" - it never blocks for minutes.
 """
 from __future__ import annotations
 
@@ -64,7 +68,14 @@ import time
 
 KEYR = re.compile(r'^([A-Za-z][A-Za-z0-9_.\-]*)\s*=(.*)$')
 EVIDR = re.compile(r'Config:\s*Missing property (\S+) in config file .*?, add "([^"]*)" to this file')
-GETOPT = re.compile(r'GetOption\s*(?:<\s*[^>]*>)?\s*\(\s*"([^"]+)"\s*,\s*([^,\)]*)')
+# two ways the fork reads a config key:  sConfigMgr->GetOption<T>("Key", default)
+# and the helper SetConfigValue<T>(enum, "Key", default) used by the CoA modules.
+# Both are searched over the whole file, because the call can span several lines.
+GETOPT = re.compile(r'GetOption\s*<\s*[^>]*>\s*\(\s*"([^"]+)"', re.S)
+SETCFG = re.compile(r'SetConfigValue\s*<\s*[^>]*>\s*\(\s*[^,"()]*\s*,\s*"([^"]+)"', re.S)
+# directories whose keys belong to another binary (unit tests, dbimport tool)
+NOT_WORLDSERVER_DIRS = ("test", "tests", "tools", "deps", "env", "build", ".git")
+DEFAULT_WAIT = 60
 MARKERS = ("coa-oneclick.sh Ergaenzungen", "coa-oneclick.sh additions")
 MARKER_LINE = "# coa-oneclick.sh additions / Ergaenzungen - keys this fork's .dist does not ship"
 CONTAINER = "ac-worldserver"
@@ -357,48 +368,94 @@ def scan_code_keys(ac_dir):
         if os.path.isdir(src):
             roots.append((src, os.path.basename(mod_dir)))
     for root_dir, owner in roots:
-        for root, _, files in os.walk(root_dir):
+        for root, dirs, files in os.walk(root_dir):
+            # unit tests and the dbimport tool read their own keys - they never
+            # run inside the worldserver, so they must not show up as "missing"
+            dirs[:] = [d for d in dirs if d not in NOT_WORLDSERVER_DIRS]
             for name in files:
                 if not name.endswith((".cpp", ".h", ".inc", ".inl")):
                     continue
                 path = os.path.join(root, name)
-                for number, line in enumerate(read(path), 1):
-                    for match in GETOPT.finditer(line):
+                text = "\n".join(read(path))
+                for pattern in (GETOPT, SETCFG):
+                    for match in pattern.finditer(text):
+                        line = text.count("\n", 0, match.start()) + 1
                         code.setdefault(match.group(1),
-                                        (owner, "%s:%d" % (os.path.relpath(path, ac_dir), number)))
+                                        (owner, "%s:%d" % (os.path.relpath(path, ac_dir), line)))
     return code
 
 
-def module_conf_for(ac_dir, module):
-    """Name of the active module conf, when the module has exactly one."""
-    dists = sorted(glob.glob(os.path.join(ac_dir, "modules", module, "conf", "*.conf.dist")))
-    if len(dists) != 1:
-        return None
-    return os.path.basename(dists[0])[:-5]          # drop ".dist"
+def defined_keys(path):
+    """Keys an existing config file (or .conf.dist) defines."""
+    if not os.path.exists(path):
+        return set()
+    return {key for _, key, _ in cfg_keys(path)}
 
 
-def ensure_module_conf(ac_dir, etc, module, conf, dry_run, evidence):
-    """Activate <etc>/modules/<conf> from the module's own template when missing.
+def shared_prefix(key, keys):
+    """Length of the longest common leading dot-segment run (0 = no overlap)."""
+    parts = key.split(".")
+    best = 0
+    for other in keys:
+        count = 0
+        for a, b in zip(parts, other.split(".")):
+            if a != b:
+                break
+            count += 1
+        best = max(best, count)
+    return best
 
-    Needed here because a key can be written into a module config that does not
-    exist yet (e.g. when the docker-based template step could not run): starting
-    from the module's .conf.dist keeps all the other keys defined - with the
-    values that were in effect before, exactly like the activation step.
+
+def target_conf(ac_dir, etc, world_conf, key, owner):
+    """(target, template) of the config file that should define this key.
+
+    A key the code reads literally is written to the config of its owner (the
+    module that reads it, or worldserver.conf for the core). A key the code
+    builds at runtime (Acore::StringFormat("EtherealBazaar.Tokens.{}.Min", ...))
+    has no owner, so the config that already defines the closest key wins -
+    which is also how a module with several .conf.dist files is resolved
+    (mod-ascension-compat: coa_bugreport.conf vs mod_ascension_compat.conf).
     """
-    target = os.path.join(etc, "modules", conf)
+    if owner == "core":
+        return world_conf, None
+    candidates = []
+    if owner:
+        for dist in sorted(glob.glob(os.path.join(ac_dir, "modules", owner, "conf", "*.conf.dist"))):
+            candidates.append((os.path.join(etc, "modules", os.path.basename(dist)[:-5]), dist))
+        if not candidates:
+            return None, None
+    else:
+        candidates.append((world_conf, None))
+        for dist in sorted(glob.glob(os.path.join(etc, "modules", "*.conf.dist"))):
+            candidates.append((dist[:-5], dist))
+
+    best, best_score, best_dist = None, 0, None
+    for target, dist in candidates:
+        source = target if os.path.exists(target) else (dist or target)
+        score = shared_prefix(key, defined_keys(source))
+        if best is None or score > best_score:
+            best, best_score, best_dist = target, score, dist
+    if best_score == 0 and not (owner and len(candidates) == 1):
+        # no overlap with what any config already defines: too risky to guess
+        return None, None
+    return best, best_dist
+
+
+def activate_from_dist(target, dist, evidence, dry_run):
+    """Create <target> from its template and keep the values that were in effect."""
     if os.path.exists(target):
-        return target
-    dist = os.path.join(ac_dir, "modules", module, "conf", conf + ".dist")
-    if not os.path.exists(dist):
-        return None
-    print("      ACTIVATE : %-26s (from modules/%s/conf)" % (conf, module))
+        return True
+    if not dist or not os.path.exists(dist):
+        return False
+    print("      ACTIVATE : %-26s (from %s)"
+          % (os.path.basename(target), os.path.relpath(dist)))
     if dry_run:
-        return target
+        return True
     os.makedirs(os.path.dirname(target), exist_ok=True)
     shutil.copyfile(dist, target)
     os.chmod(target, 0o644)
     apply_evidence_to_conf(target, evidence, dry_run)
-    return target
+    return True
 
 
 def write_missing_keys(ac_dir, etc, world_conf, evidence, dry_run):
@@ -417,19 +474,12 @@ def write_missing_keys(ac_dir, etc, world_conf, evidence, dry_run):
     unfixable = []
     for key in sorted(evidence):
         owner = code.get(key, (None, None))[0]
-        if owner is None:
-            unfixable.append((key, "the code builds the key at runtime"))
-            continue
-        if owner == "core":
-            targets.setdefault(world_conf, []).append((key, evidence[key]))
-            continue
-        conf = module_conf_for(ac_dir, owner)
-        if not conf:
-            unfixable.append((key, "owner %s has no unique .conf.dist" % owner))
-            continue
-        target = ensure_module_conf(ac_dir, etc, owner, conf, dry_run, evidence)
+        target, dist = target_conf(ac_dir, etc, world_conf, key, owner)
         if target is None:
-            unfixable.append((key, "no template modules/%s/conf/%s.dist" % (owner, conf)))
+            unfixable.append((key, "no config of this fork defines a related key"))
+            continue
+        if not activate_from_dist(target, dist, evidence, dry_run):
+            unfixable.append((key, "template %s is not available" % (dist or target)))
             continue
         targets.setdefault(target, []).append((key, evidence[key]))
 
@@ -498,8 +548,29 @@ def fix_ownership(paths):
     return count
 
 
+def container_state():
+    """State of the worldserver container (docker inspect)."""
+    rc, out = docker(["inspect", "-f", "{{.State.Status}}", CONTAINER], timeout=30)
+    return out.strip() or ("unknown" if rc != 0 else "missing")
+
+
+def container_restarts():
+    """How often the worldserver container was restarted (0 when unknown)."""
+    rc, out = docker(["inspect", "-f", "{{.RestartCount}}", CONTAINER], timeout=30)
+    try:
+        return int(out.strip())
+    except ValueError:
+        return 0
+
+
 def restart_and_verify(ac_dir, wait_seconds):
-    """Restart the worldserver and prove that both message types are gone."""
+    """Restart the worldserver and prove that both message types are gone.
+
+    The wait for "World Initialized" is deliberately short and shows progress:
+    the config changes are already written, so a worldserver that simply needs
+    longer to load its world must not block the script. What counts is the new
+    log - it is checked even when the load is still running.
+    """
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
     info("restarting %s ..." % CONTAINER)
     rc, out = docker(["compose", "restart", CONTAINER], cwd=ac_dir)
@@ -507,20 +578,43 @@ def restart_and_verify(ac_dir, wait_seconds):
         warn("'docker compose restart %s' returned %d: %s"
              % (CONTAINER, rc, out.strip()[:200]))
 
-    info("waiting for the worldserver (max. %ds) ..." % wait_seconds)
+    info("waiting for the worldserver: max. %ds (progress every 15s, Ctrl-C is safe - "
+         "the config is already written)" % wait_seconds)
     ready = False
-    deadline = time.time() + wait_seconds
-    while time.time() < deadline:
-        _, tail = docker(["logs", "--tail", "300", CONTAINER], timeout=60)
-        if "World Initialized" in tail:
+    waited = 0
+    last_lines = ""
+    while waited < wait_seconds:
+        _, last_lines = docker(["logs", "--since", stamp, "--tail", "30", CONTAINER], timeout=60)
+        if "World Initialized" in last_lines:
             ready = True
             break
-        time.sleep(5)
+        if waited % 15 == 0:
+            state = container_state()
+            tail = [l for l in last_lines.splitlines() if l.strip()]
+            print("      ... %ss (state=%s) last: %s"
+                  % (waited, state, tail[-1][-90:] if tail else "(no new output yet)"))
+        time.sleep(3)
+        waited += 3
+
     if ready:
-        ok("worldserver is up ('World Initialized')")
+        ok("worldserver is up ('World Initialized' after %ds)" % waited)
     else:
-        warn("the start was not confirmed within %ds - check: docker logs -f %s"
-             % (wait_seconds, CONTAINER))
+        state = container_state()
+        restarts = container_restarts()
+        tail = [l for l in last_lines.splitlines() if l.strip()]
+        warn("the worldserver is still loading after %ds (state=%s, restarts=%d) - the config"
+             % (wait_seconds, state, restarts))
+        warn("changes are already applied; this is only the check: docker logs -f %s" % CONTAINER)
+        if state in ("exited", "dead") or restarts > 2:
+            warn("state '%s' with %d restarts means it did NOT come up - last lines:"
+                 % (state, restarts))
+            _, crash = docker(["logs", "--tail", "20", CONTAINER], timeout=60)
+            for line in crash.splitlines()[-20:]:
+                print("      %s" % line)
+            warn("the config it just got is the new part - if it does not start, send the lines above")
+            return 1
+        if tail:
+            print("      last line: %s" % tail[-1][-120:])
 
     _, new_log = docker(["logs", "--since", stamp, CONTAINER])
     _, whole_log = docker(["logs", CONTAINER])
@@ -535,14 +629,19 @@ def restart_and_verify(ac_dir, wait_seconds):
     print("missing-property lines in the new log  : %d" % missing_hits)
     print("duplicate-key lines in the new log     : %d" % duplicate_hits)
     print()
-    print("module configs the worldserver uses:")
-    for line in clean.splitlines():
-        if re.search(r">\s+\S+\.conf\s*$", line):
-            print("      %s" % line.lstrip("> ").strip())
+    configs = [line.lstrip("> ").strip() for line in clean.splitlines()
+               if re.search(r">\s+\S+\.conf\s*$", line)]
+    if configs:
+        print("module configs the worldserver uses:")
+        for name in configs:
+            print("      %s" % name)
 
     print()
-    if ready and missing_hits == 0 and duplicate_hits == 0:
-        ok("no config warnings in the new log")
+    if missing_hits == 0 and duplicate_hits == 0:
+        if ready:
+            ok("no config warnings in the new log")
+        else:
+            ok("no config warnings in the new log so far (the world is still loading)")
         info("the old lines stay until the container log rotates (logging max-size/max-file)")
         return 0
     warn("the new log still reports config warnings - please send:")
@@ -556,7 +655,11 @@ def main():
         description="Remove 'Config: Missing property' / 'Duplicate key name' from the worldserver log.")
     parser.add_argument("--ac-dir", default="/opt/azerothcore", help="deployment directory")
     parser.add_argument("--etc", default=None, help="default: <ac-dir>/env/dist/etc")
-    parser.add_argument("--wait", type=int, default=420, help="seconds to wait for 'World Initialized'")
+    parser.add_argument("--wait", type=int, default=DEFAULT_WAIT,
+                        help="seconds to wait for 'World Initialized' (default %d). The config is "
+                             "written BEFORE the wait, so the script does not block on a worldserver "
+                             "that needs longer to load - it reports it and checks the new log anyway."
+                             % DEFAULT_WAIT)
     parser.add_argument("--log", default=None, help="use this log file as evidence instead of 'docker logs'")
     parser.add_argument("--dry-run", action="store_true", help="report only, change nothing")
     parser.add_argument("--no-restart", action="store_true", help="edit the configs, do not restart")
