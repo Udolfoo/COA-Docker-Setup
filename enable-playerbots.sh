@@ -428,11 +428,18 @@ db_sync() {
             n=$((n + 1))
             size="$(du -h "$f" 2>/dev/null | cut -f1)"
             printf "      [%2d] %-46s %s\n" "$n" "$(basename "$f")" "$size"
-            err="$(mysql_file "$f" "$PB_DB" 2>&1 >/dev/null)"
-            if [ -n "$err" ]; then
+            # Judge by the exit code, never by stderr: the mysql client always
+            # writes "Using a password on the command line interface can be
+            # insecure" to stderr, which used to look like a failed import.
+            err="$(mysql_file "$f" "$PB_DB" 2>&1 >/dev/null)"; rc=$?
+            err="$(printf '%s\n' "$err" \
+                   | grep -v 'Using a password on the command line interface' \
+                   | grep -v '^$' | tail -3)"
+            if [ "$rc" -ne 0 ]; then
                 case "$err" in
                     *'Duplicate entry'*) warn "$(basename "$f"): rows already present - treated as imported" ;;
-                    *) die "base import failed at $(basename "$f"): $(printf '%s' "$err" | tail -1)" ;;
+                    *'already exists'*)  warn "$(basename "$f"): objects already present - treated as imported" ;;
+                    *) die "base import failed at $(basename "$f") (mysql exit ${rc}): ${err:-no message}" ;;
                 esac
             fi
         done < <(find "$MOD_SQL/playerbots/base" -maxdepth 1 -name '*.sql' | LC_ALL=C sort)
