@@ -12,8 +12,11 @@ Cause 1 - "Missing property": AzerothCore loads <etc>/modules/<name>.conf only,
 never the .conf.dist template. A module whose .conf was never copied from its
 .conf.dist is not configured at all: every key it reads falls back to the
 hardcoded code default and logs one warning per read, which is tens of thousands
-of log lines per day. It is not an error (the code default is used), but it
-buries real errors.
+of log lines per day. Every module the core ships brings its own template
+(mod-coa-challenges 50 keys, mod-ethereal-bazaar 18, mod-dynamic-xp 15, ...), and
+upstream adds modules over time - a config that was complete last month is not
+complete after the next core update. It is not an error (the code default is
+used), but it buries real errors.
 
 Cause 2 - "Duplicate key name": the block appended to the end of
 worldserver.conf by older coa-oneclick.sh runs repeats keys that the fork's
@@ -23,13 +26,17 @@ anything except print a warning on every start.
 
 What this script does (idempotent, safe to run at any time):
 
+  0. pull the module config templates from the image (env/ref/etc/modules) into
+     <etc>/modules - a module that was added by a core update is only known to
+     the image, and the entrypoint copies the templates only when the container
+     starts.
   1. activate every <etc>/modules/*.conf.dist that has no matching .conf. For
      keys where the log proves the value in effect differed from the .dist
      value, the value in effect is kept, so behaviour does not change.
   2. drop the duplicate keys from worldserver.conf (the first definition, the
      one that was in effect, stays).
-  3. report config keys read by the module code that are still undefined, so a
-     future module update cannot reintroduce the noise unnoticed.
+  3. define the keys the log reported as missing (with the value the code used
+     until now - so only the warning disappears), and report what is left.
   4. restart ac-worldserver, wait for "World Initialized" and check the new log
      for both message types.
 
@@ -40,6 +47,8 @@ Usage:
     sudo python3 fix-config-warnings.py --no-restart   # edit, do not restart
 
 Options: --etc PATH --ac-dir PATH --wait SECONDS
+         coa-oneclick.sh / coa-update.sh call this script with --no-restart
+         (they restart the stack themselves).
 """
 from __future__ import annotations
 
@@ -47,6 +56,7 @@ import argparse
 import glob
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -58,6 +68,10 @@ GETOPT = re.compile(r'GetOption\s*(?:<\s*[^>]*>)?\s*\(\s*"([^"]+)"\s*,\s*([^,\)]
 MARKERS = ("coa-oneclick.sh Ergaenzungen", "coa-oneclick.sh additions")
 MARKER_LINE = "# coa-oneclick.sh additions / Ergaenzungen - keys this fork's .dist does not ship"
 CONTAINER = "ac-worldserver"
+IMAGE_NAME = "acore/ac-wotlk-worldserver:%s"
+DEFAULT_IMAGE_TAG = "coa"
+REF_ETC_MODULES = "/azerothcore/env/ref/etc/modules"
+MISSING_BLOCK = ("# --- keys that only the code defined so far (values = the code defaults in use) ---")
 
 
 def info(msg):
@@ -151,10 +165,86 @@ def collect_evidence(log_path=None, skip_docker=False):
     return evidence, len(out.splitlines())
 
 
+def image_tag(ac_dir):
+    """The image tag coa-oneclick.sh wrote into <ac_dir>/.env."""
+    env_file = os.path.join(ac_dir, ".env")
+    if os.path.exists(env_file):
+        for line in read(env_file):
+            if line.startswith("DOCKER_IMAGE_TAG="):
+                value = line.split("=", 1)[1].strip()
+                if value:
+                    return value
+    return DEFAULT_IMAGE_TAG
+
+
+def sync_templates_from_image(ac_dir, etc, dry_run):
+    """Copy env/ref/etc/modules from the image into <etc>/modules.
+
+    The container entrypoint does that at every start, but only with "cp -n"
+    (never overwriting) and only from the image of the running container. A core
+    update that adds a module ships the new .conf.dist inside the image, so a
+    script that only reads the host directory would not see it - and the module
+    would keep logging "Missing property" for every key it reads.
+    """
+    image = IMAGE_NAME % image_tag(ac_dir)
+    rc, out = docker(["image", "inspect", image], timeout=60)
+    if rc != 0:
+        warn("image %s not found - templates are taken from %s/modules only"
+             % (image, etc))
+        return []
+    rc, listing = docker(["run", "--rm", "--entrypoint", "/bin/ls", image, REF_ETC_MODULES],
+                         timeout=120)
+    if rc != 0:
+        warn("cannot list %s in %s: %s" % (REF_ETC_MODULES, image, listing.strip()[:120]))
+        return []
+
+    target_dir = os.path.join(etc, "modules")
+    wanted = [name.strip() for name in listing.splitlines() if name.strip().endswith(".conf.dist")]
+    missing = [name for name in wanted if not os.path.exists(os.path.join(target_dir, name))]
+    print("      templates in %s: %d   missing in %s: %d"
+          % (image, len(wanted), target_dir, len(missing)))
+    if not missing:
+        return []
+    for name in sorted(missing):
+        print("      FETCH    : %s" % name)
+    if dry_run:
+        return missing
+
+    os.makedirs(target_dir, exist_ok=True)
+    # tar stream into the config directory; --skip-old-files behaves like the
+    # entrypoint's "cp -n" (existing files are never overwritten)
+    command = ("docker run --rm --entrypoint tar %s -cf - -C /azerothcore/env/ref/etc modules "
+               "| tar -xf - -C %s --skip-old-files" % (shlex.quote(image), shlex.quote(etc)))
+    try:
+        proc = subprocess.run(["/bin/sh", "-c", command], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        warn("extracting the module templates failed: %s" % exc)
+        return []
+    if proc.returncode != 0:
+        warn("extracting the module templates failed (exit %d): %s"
+             % (proc.returncode, proc.stdout.decode("utf-8", "replace").strip()[-200:]))
+        return []
+
+    still_missing = [name for name in missing if not os.path.exists(os.path.join(target_dir, name))]
+    if still_missing:
+        warn("could not fetch: %s" % ", ".join(still_missing))
+    fetched = [name for name in missing if name not in still_missing]
+    if fetched:
+        ok("%d module config template(s) fetched from the image" % len(fetched))
+    return fetched
+
+
 def activate_module_configs(etc, evidence, dry_run):
     """Copy every module .conf.dist without a .conf and keep the values in effect."""
+    dists = sorted(glob.glob(os.path.join(etc, "modules", "*.conf.dist")))
+    if not dists:
+        warn("no *.conf.dist in %s/modules - nothing to activate. On a normal run the"
+             % etc)
+        warn("templates are fetched from the image (needs docker + the worldserver image).")
+        return []
     activated, present = [], []
-    for dist in sorted(glob.glob(os.path.join(etc, "modules", "*.conf.dist"))):
+    for dist in dists:
         target = dist[:-5]
         if os.path.exists(target):
             present.append(os.path.basename(target))
@@ -171,32 +261,40 @@ def activate_module_configs(etc, evidence, dry_run):
         print("      every module .conf.dist already has an active .conf")
 
     for target in activated:
-        path = target if os.path.exists(target) else target + ".dist"
-        edits = [(index, key, value, evidence[key]) for index, key, value in cfg_keys(path)
-                 if key in evidence and norm(evidence[key]) != norm(value)]
-        if not edits:
-            continue
-        print("      %s: %d key(s) differ, keeping the value in effect:"
-              % (os.path.basename(target), len(edits)))
-        for _, key, dist_value, effective in edits:
-            print("         %-44s .dist %s -> kept %s" % (key, dist_value, effective))
-        if dry_run:
-            continue
-        by_index = {index: (key, dist_value, effective)
-                    for index, key, dist_value, effective in edits}
-        out = []
-        for index, line in enumerate(read(path)):
-            if index in by_index:
-                key, dist_value, effective = by_index[index]
-                out.append("")
-                out.append("# kept at the value that was in effect before this module config")
-                out.append("# existed (the hardcoded code default). This fork's .dist "
-                           "default is: %s" % dist_value)
-                out.append("%s = %s" % (key, effective))
-            else:
-                out.append(line)
-        write(path, out)
+        apply_evidence_to_conf(target, evidence, dry_run)
     return activated
+
+
+def apply_evidence_to_conf(target, evidence, dry_run):
+    """Keep the value that was in effect for keys whose .dist default differs."""
+    if not evidence:
+        return 0
+    path = target if os.path.exists(target) else target + ".dist"
+    edits = [(index, key, value, evidence[key]) for index, key, value in cfg_keys(path)
+             if key in evidence and norm(evidence[key]) != norm(value)]
+    if not edits:
+        return 0
+    print("      %s: %d key(s) differ, keeping the value in effect:"
+          % (os.path.basename(target), len(edits)))
+    for _, key, dist_value, effective in edits:
+        print("         %-44s .dist %s -> kept %s" % (key, dist_value, effective))
+    if dry_run:
+        return len(edits)
+    by_index = {index: (key, dist_value, effective)
+                for index, key, dist_value, effective in edits}
+    out = []
+    for index, line in enumerate(read(path)):
+        if index in by_index:
+            key, dist_value, effective = by_index[index]
+            out.append("")
+            out.append("# kept at the value that was in effect before this module config")
+            out.append("# existed (the hardcoded code default). This fork's .dist "
+                       "default is: %s" % dist_value)
+            out.append("%s = %s" % (key, effective))
+        else:
+            out.append(line)
+    write(path, out)
+    return len(edits)
 
 
 def dedupe_worldserver_conf(world_conf, dry_run):
@@ -233,9 +331,141 @@ def dedupe_worldserver_conf(world_conf, dry_run):
     return len(duplicates)
 
 
+def switch_off(key, active_values):
+    """True when the switch that gates this key is explicitly off.
+
+    Example: CoAGameplayTest.* is only read while CoAGameplayTest.Enable = 1, so
+    the keys cannot produce "Missing property" lines while it is 0.
+    """
+    segment = key.split(".")[0]
+    for candidate in (segment + ".Enable", segment + ".Enabled"):
+        value = active_values.get(candidate)
+        if value is not None:
+            return norm(value) == "0"
+    return False
+
+
+def scan_code_keys(ac_dir):
+    """{key: (owner, "relative/path:line")} - owner is a module dir or 'core'."""
+    code = {}
+    roots = []
+    core_src = os.path.join(ac_dir, "src")
+    if os.path.isdir(core_src):
+        roots.append((core_src, "core"))
+    for mod_dir in sorted(glob.glob(os.path.join(ac_dir, "modules", "*"))):
+        src = os.path.join(mod_dir, "src")
+        if os.path.isdir(src):
+            roots.append((src, os.path.basename(mod_dir)))
+    for root_dir, owner in roots:
+        for root, _, files in os.walk(root_dir):
+            for name in files:
+                if not name.endswith((".cpp", ".h", ".inc", ".inl")):
+                    continue
+                path = os.path.join(root, name)
+                for number, line in enumerate(read(path), 1):
+                    for match in GETOPT.finditer(line):
+                        code.setdefault(match.group(1),
+                                        (owner, "%s:%d" % (os.path.relpath(path, ac_dir), number)))
+    return code
+
+
+def module_conf_for(ac_dir, module):
+    """Name of the active module conf, when the module has exactly one."""
+    dists = sorted(glob.glob(os.path.join(ac_dir, "modules", module, "conf", "*.conf.dist")))
+    if len(dists) != 1:
+        return None
+    return os.path.basename(dists[0])[:-5]          # drop ".dist"
+
+
+def ensure_module_conf(ac_dir, etc, module, conf, dry_run, evidence):
+    """Activate <etc>/modules/<conf> from the module's own template when missing.
+
+    Needed here because a key can be written into a module config that does not
+    exist yet (e.g. when the docker-based template step could not run): starting
+    from the module's .conf.dist keeps all the other keys defined - with the
+    values that were in effect before, exactly like the activation step.
+    """
+    target = os.path.join(etc, "modules", conf)
+    if os.path.exists(target):
+        return target
+    dist = os.path.join(ac_dir, "modules", module, "conf", conf + ".dist")
+    if not os.path.exists(dist):
+        return None
+    print("      ACTIVATE : %-26s (from modules/%s/conf)" % (conf, module))
+    if dry_run:
+        return target
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copyfile(dist, target)
+    os.chmod(target, 0o644)
+    apply_evidence_to_conf(target, evidence, dry_run)
+    return target
+
+
+def write_missing_keys(ac_dir, etc, world_conf, evidence, dry_run):
+    """Define the keys the log complains about, with the value that is in effect.
+
+    The log line carries the value the code used ("... add \"KEY = VALUE\" to this
+    file"), so writing it changes nothing except that the warning disappears.
+    A key read by exactly one module goes into that module's config; a core key
+    goes into one marked block at the end of worldserver.conf (the fork's
+    worldserver.conf.dist is never loaded, so there is no duplicate).
+    """
+    if not evidence:
+        return 0
+    code = scan_code_keys(ac_dir)
+    targets = {}
+    unfixable = []
+    for key in sorted(evidence):
+        owner = code.get(key, (None, None))[0]
+        if owner is None:
+            unfixable.append((key, "the code builds the key at runtime"))
+            continue
+        if owner == "core":
+            targets.setdefault(world_conf, []).append((key, evidence[key]))
+            continue
+        conf = module_conf_for(ac_dir, owner)
+        if not conf:
+            unfixable.append((key, "owner %s has no unique .conf.dist" % owner))
+            continue
+        target = ensure_module_conf(ac_dir, etc, owner, conf, dry_run, evidence)
+        if target is None:
+            unfixable.append((key, "no template modules/%s/conf/%s.dist" % (owner, conf)))
+            continue
+        targets.setdefault(target, []).append((key, evidence[key]))
+
+    written = 0
+    for path, pairs in sorted(targets.items()):
+        existing = {key for _, key, _ in cfg_keys(path)} if os.path.exists(path) else set()
+        todo = [(key, value) for key, value in pairs if key not in existing]
+        if not todo:
+            continue
+        for key, value in todo:
+            print("      DEFINE   : %-44s %s  (%s)" % (key, value, os.path.basename(path)))
+        if dry_run:
+            written += len(todo)
+            continue
+        lines = read(path) if os.path.exists(path) else []
+        while lines and not lines[-1].strip():
+            lines.pop()
+        lines.append("")
+        if path == world_conf:
+            lines.append(MISSING_BLOCK)
+        lines.append("# added by fix-config-warnings.py: the key logged 'Config: Missing property',")
+        lines.append("# the value is the one the code used until now (no behaviour change)")
+        for key, value in todo:
+            lines.append("%s = %s" % (key, value))
+        write(path, lines)
+        written += len(todo)
+
+    for key, reason in unfixable:
+        warn("%s stays undefined (%s)" % (key, reason))
+    return written
+
+
 def undefined_module_keys(ac_dir, etc, world_conf):
     """Every config key the module code reads, that no active config defines."""
     active = set()
+    active_values = {}
     candidates = [world_conf, world_conf + ".dist",
                   os.path.join(etc, "authserver.conf")]
     candidates += sorted(glob.glob(os.path.join(etc, "modules", "*.conf")))
@@ -244,20 +474,14 @@ def undefined_module_keys(ac_dir, etc, world_conf):
     candidates += sorted(glob.glob(os.path.join(etc, "modules", "*.conf.dist")))
     for path in candidates:
         if os.path.exists(path):
-            active.update(key for _, key, _ in cfg_keys(path))
+            for _, key, value in cfg_keys(path):
+                active.add(key)
+                active_values.setdefault(key, value)
 
-    code_keys = {}
-    for mod_dir in sorted(glob.glob(os.path.join(ac_dir, "modules", "*"))):
-        for root, _, files in os.walk(mod_dir):
-            for name in files:
-                if not name.endswith((".cpp", ".h", ".inc", ".inl")):
-                    continue
-                path = os.path.join(root, name)
-                for number, line in enumerate(read(path), 1):
-                    for match in GETOPT.finditer(line):
-                        code_keys.setdefault(match.group(1),
-                                             "%s:%d" % (os.path.relpath(path, ac_dir), number))
-    return code_keys, sorted(key for key in code_keys if key not in active)
+    code_keys = {key: at for key, (_, at) in scan_code_keys(ac_dir).items()}
+    undefined = sorted(key for key in code_keys if key not in active)
+    silent = [key for key in undefined if switch_off(key, active_values)]
+    return code_keys, undefined, silent
 
 
 def fix_ownership(paths):
@@ -350,6 +574,10 @@ def main():
     has_docker = shutil.which("docker") is not None
     if not has_docker and not args.log:
         warn("docker not found - the log cannot be read, so only the .dist values are used")
+    if has_docker:
+        sync_templates_from_image(args.ac_dir, etc, args.dry_run)
+    else:
+        warn("docker not found - module templates are not fetched from the image")
     evidence, log_lines = collect_evidence(args.log, skip_docker=not has_docker)
     print("      evidence source               : %s"
           % (args.log or ("docker logs %s" % CONTAINER if has_docker else "none")))
@@ -359,17 +587,25 @@ def main():
     activated = activate_module_configs(etc, evidence, args.dry_run)
     if activated:
         ok("%d module config(s) activated" % len(activated))
+    written = write_missing_keys(args.ac_dir, etc, world_conf, evidence, args.dry_run)
+    if written:
+        ok("%d key(s) that logged 'Missing property' are defined now" % written)
     dedupe_worldserver_conf(world_conf, args.dry_run)
 
-    code_keys, undefined = undefined_module_keys(args.ac_dir, etc, world_conf)
-    print("      config keys read by module code: %d   still undefined: %d"
-          % (len(code_keys), len(undefined)))
-    for key in undefined:
+    code_keys, undefined, silent = undefined_module_keys(args.ac_dir, etc, world_conf)
+    loud = [key for key in undefined if key not in silent]
+    print("      config keys read by module code: %d   undefined: %d (%d behind a switch that is off)"
+          % (len(code_keys), len(undefined), len(silent)))
+    for key in loud:
         print("         %-44s %s" % (key, code_keys[key]))
-    if undefined:
+    for key in silent:
+        print("         %-44s %s   (switch off - stays silent)" % (key, code_keys[key]))
+    if loud:
         warn("those keys log 'Missing property' as soon as their code path runs - the")
-        warn("matching module .conf.dist has to define them. Keys behind a switch that is")
-        warn("off (e.g. CoAGameplayTest.* while CoAGameplayTest.Enable = 0) stay silent.")
+        warn("matching module .conf.dist has to define them.")
+    elif silent:
+        info("%d key(s) are only read behind a switch that is off "
+             "(e.g. CoAGameplayTest.Enable = 0) and cannot write log lines" % len(silent))
 
     if args.dry_run:
         info("DRY-RUN finished - no file was changed")
