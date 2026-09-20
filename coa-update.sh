@@ -4,8 +4,10 @@
 # ----------------------------------------------------------------------------
 #  Flow:
 #    1. Update the repo (git fetch/checkout) + re-apply the build fix
+#    1b. Optional mod-playerbots: update the module + sync its config
 #    2. Apply missing core/module SQL updates from the repo to the databases
-#       (tolerant; uses apply-missing-updates.sh from the same folder)
+#       (tolerant; uses apply-missing-updates.sh from the same folder - and
+#       acore_playerbots when the playerbots module is installed)
 #    3. Rebuild docker images - only if the code changed (or if FULL=1 is set)
 #    4. Restart the stack + print a status report
 #
@@ -194,6 +196,48 @@ PYEOF
     ok "Build fix 2 re-applied (NearTeleportTo temporary -> named Position)"
 else
     ok "Build fix 2 not required (NearTeleportTo)"
+fi
+
+# --- Optional module: mod-playerbots (installed by enable-playerbots.sh) -----
+# The module is a git clone in modules/mod-playerbots (the core's .gitignore
+# leaves modules/ alone, so the checkout above never touches it). A changed
+# module needs a rebuild just like a changed core, and its SQL updates have to
+# reach acore_playerbots (apply-missing-updates.sh does that in step 2).
+if [ -d "modules/mod-playerbots/.git" ]; then
+    step "1b/5  Playerbots module (optional)"
+    PM_BRANCH="${PLAYERBOTS_BRANCH:-$(grep -E '^PLAYERBOTS_BRANCH=' .env 2>/dev/null | head -1 | cut -d= -f2-)}"
+    PM_BRANCH="${PM_BRANCH:-coa}"
+    PM_REF="${PLAYERBOTS_REF:-$(grep -E '^PLAYERBOTS_REF=' .env 2>/dev/null | head -1 | cut -d= -f2-)}"
+    PM_BEFORE="$(git -C modules/mod-playerbots rev-parse HEAD 2>/dev/null)"
+    if git -C modules/mod-playerbots fetch --prune origin "$PM_BRANCH" >/dev/null 2>&1; then
+        if [ -n "$PM_REF" ]; then
+            git -C modules/mod-playerbots checkout -q "$PM_REF" >/dev/null 2>&1 \
+                || warn "module: cannot check out PLAYERBOTS_REF=$PM_REF"
+        else
+            git -C modules/mod-playerbots checkout -q -B "$PM_BRANCH" FETCH_HEAD >/dev/null 2>&1 \
+                || warn "module: checkout failed (local changes?) - keeping the current revision"
+        fi
+    else
+        warn "module: git fetch failed - keeping the installed revision"
+    fi
+    PM_AFTER="$(git -C modules/mod-playerbots rev-parse HEAD 2>/dev/null)"
+    if [ -n "$PM_BEFORE" ] && [ "$PM_BEFORE" != "$PM_AFTER" ]; then
+        ok "Playerbots module updated: ${PM_BEFORE:0:9} -> ${PM_AFTER:0:9}"
+        git -C modules/mod-playerbots log --oneline "${PM_BEFORE}..${PM_AFTER}" 2>/dev/null | head -10 | sed 's/^/      /'
+        CODE_CHANGED=1
+    else
+        ok "Playerbots module unchanged (${PM_AFTER:0:9})"
+    fi
+    # A module update can add config keys. A key that is defined nowhere logs
+    # "Config: Missing property" on every read (tens of thousands of lines per
+    # day) and silently falls back to the code default, so keep the config
+    # complete. Values this deployment manages are re-applied as well.
+    if [ -f "$SCRIPT_DIR/enable-playerbots.sh" ]; then
+        AC_DIR="$AC_DIR" bash "$SCRIPT_DIR/enable-playerbots.sh" --config \
+            || warn "playerbots.conf could not be synced (see the output above)"
+    fi
+else
+    log "Playerbots module not installed (optional) - see enable-playerbots.sh"
 fi
 
 step "2/5  Database updates (core/module fixes)"

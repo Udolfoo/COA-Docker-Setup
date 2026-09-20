@@ -26,7 +26,7 @@ fork (Conquest of AzerothCore) on your own Linux server – including a one-comm
 # 1) copy the scripts to your server (keep all files in the same folder)
 scp coa-oneclick.sh coa-update.sh apply-missing-updates.sh \
     check-repo-updates.sh fix-build-network.sh fix-container-dns.sh \
-    docker-compose.override.yml root@<SERVER-IP>:/root/
+    fix-config-warnings.py docker-compose.override.yml root@<SERVER-IP>:/root/
 
 # 2) deploy (base: standard AzerothCore world, downloaded client data v20.0)
 bash /root/coa-oneclick.sh 2>&1 | tee /root/coa-deploy.log
@@ -48,6 +48,9 @@ CLIENT_DATA=/root/Data.rar \
 GM_ACCOUNT=MyName:MyPass:3 \
 bash /root/coa-oneclick.sh 2>&1 | tee /root/coa-deploy.log
 ```
+
+Player bots (optional): add `WITH_PLAYERBOTS=1` to any command above, or install them later on a
+running server with `bash enable-playerbots.sh` – see [Player bots](#player-bots-optional).
 
 Then, in your client `realmlist.wtf`:
 
@@ -118,10 +121,11 @@ bash coa-oneclick.sh
 | Base | Installs Docker + Compose if missing, creates a swap file (OOM protection) |
 | Repository | Clones/updates `/opt/azerothcore`, applies the **build fix** for `mod-ascension-compat` |
 | Configuration | Writes `.env` (DB bound to `127.0.0.1:13306`, **random DB root password**), module configs |
+| Player bots (optional) | `WITH_PLAYERBOTS=1`: clones `modules/mod-playerbots`, writes `playerbots.conf`, creates `acore_playerbots` + the module base data (see [Player bots](#player-bots-optional)) |
 | Client data | Extracts `.rar`/`.zip`/folder (`CLIENT_DATA`) or lets the container download v20.0 |
-| Images | `docker compose build` (skipped when images already exist) |
+| Images | `docker compose build` (skipped when images already exist, forced with `WITH_PLAYERBOTS=1`) |
 | Database | Imports **only the `acore_world` part** of a CoA dump (auth/characters stay untouched), keeps a rollback copy as `acore_world_old`, disables the AzerothCore auto-updater |
-| Updates | Applies all missing repo SQL fixes for **auth, characters and world** |
+| Updates | Applies all missing repo SQL fixes for **auth, characters, world** – and `acore_playerbots` when the bot module is installed |
 | Start | Starts the stack, adds missing core options, sets the realm address |
 | Summary | Optional GM account + status report |
 
@@ -170,6 +174,99 @@ offline/version-mismatch bits again (the client would show *Realm Offline*).
 `PENDING` / `ARCHIVED` / `MODULE`). Files whose content changed are re-applied and re-hashed.
 Duplicate-key errors simply mean "content already present" and are registered as applied.
 Manual helper scripts under `data/sql/manual/` are never touched.
+
+---
+
+## Player bots (optional)
+
+The deployment can run **[Zyth45/mod-playerbots](https://github.com/Zyth45/mod-playerbots)** – the
+*Conquest of Azeroth* port of `mod-playerbots`: random bots fill the world, alt characters can be
+driven by the bot AI, and `.playerbots coa tank|heal|dps` recruits a bot of a CoA class with its
+specialization, rotation and gear weights.
+
+Player bots are **optional and can be added at any time** – the module is compiled into the
+worldserver image only while it is present in `modules/`. A server without bots stays a server
+without bots; the deployment only gets one extra file (`enable-playerbots.sh`).
+
+### Add bots to an existing server (one command)
+
+```bash
+scp enable-playerbots.sh root@<SERVER-IP>:/root/
+bash /root/enable-playerbots.sh        # module + config + database + rebuild + restart
+```
+
+The script is idempotent – run it again after a module update or to change a setting.
+In the game afterwards: `.playerbots coa dps` recruits a DPS bot, `.playerbots rndbot stats` shows
+the pool, `/w <bot> help` lists every command.
+
+### Or install them together with the deployment
+
+```bash
+WITH_PLAYERBOTS=1 bash /root/coa-oneclick.sh                        # 200 random bots
+PLAYERBOTS_COUNT=500 WITH_PLAYERBOTS=1 bash /root/coa-oneclick.sh   # 500 random bots
+PLAYERBOTS_AUTOLOGIN=0 WITH_PLAYERBOTS=1 bash /root/coa-oneclick.sh # only bots you recruit
+```
+
+### Settings
+
+The `PLAYERBOTS_*` values are remembered in `/opt/azerothcore/.env`, so `coa-update.sh` keeps them.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PLAYERBOTS_COUNT` | `200` | random bots; ~3.5 GB RAM for 200, ~10 GB for 1000 |
+| `PLAYERBOTS_AUTOLOGIN` | `1` | `0` = no random bots at all (only bots you recruit) |
+| `PLAYERBOTS_MAP_THREADS` | `8` | raises `MapUpdate.Threads` in `worldserver.conf` (`0` = leave it) |
+| `PLAYERBOTS_REPO` / `PLAYERBOTS_BRANCH` | `Zyth45/mod-playerbots` / `coa` | module source |
+| `PLAYERBOTS_REF` | – | tag or commit to pin (the script prints the available `bots-*` tags) |
+| `BASE_FORCE` | `0` | `1` = import the module base data again |
+| `SKIP_BUILD` | `0` | `1` = no image rebuild (config/database only) |
+
+Everything else lives in `env/dist/etc/modules/playerbots.conf`. The file is yours: the script only
+syncs the values it manages (CoA zone channel `3`, Ascension world channel, database, bot count,
+`CoaSpecRotations`, `BotActiveAlone`, `GroupInvitationPermission`) and appends keys a module update
+adds – a key that is defined nowhere logs `Config: Missing property` on every read and silently
+falls back to the code default.
+
+### What the script does (and why the database work runs on the host)
+
+| Step | Content |
+|---|---|
+| Module | `git clone`/`fetch` of `modules/mod-playerbots` (branch `coa`) |
+| Config | `playerbots.conf` + `MapUpdate.Threads` (the stock default `1` starves hundreds of bots) |
+| Database | `acore_playerbots` + module base data (names, texts, travel nodes) + all missing module updates for `acore_playerbots`, `acore_world` and `acore_characters` |
+| Images | `docker compose build` (the worldserver compiles the module in) |
+| Start | stack restart, realm flag, verification (module, image, database, bot accounts) |
+
+`mod-playerbots` normally populates and updates its own database at worldserver startup. The runtime
+image contains no module sources (only the `ac-db-import` image gets `data/` and `modules/`), so the
+worldserver would stop with an empty source directory. This deployment therefore keeps the module
+updater off (`Playerbots.Updates.EnableDatabases = 0`, the `AUTOUPDATER ... disabled` warning for
+`Playerbots` in the log is expected) and applies the SQL from the host – the same place where the
+core updates are applied:
+
+```bash
+bash /root/enable-playerbots.sh --status        # read-only: module, image, database, bots
+bash /root/apply-missing-updates.sh             # missing updates for all four databases
+bash /root/check-repo-updates.sh                # which updates are not registered yet
+docker exec ac-worldserver tail -30 /azerothcore/env/dist/logs/Playerbots.log
+```
+
+`coa-update.sh` keeps everything in sync: it updates the module, re-syncs `playerbots.conf`,
+applies the missing module updates and rebuilds the image when the module changed.
+
+### Notes
+
+* After enabling the bots the first start takes a few minutes: the module creates the bot accounts
+  and the first bots log in (`enable-playerbots.sh --status` shows the count).
+* Memory: 200 random bots ≈ 3.5 GB on top of the worldserver, 1000 ≈ 10 GB. The swap file of the
+  deployment protects the build, not the running server.
+* Recommended by the module for CoA (set it manually if you want it):
+  `CharacterCreating.Disabled.ClassMask = 2047` in `worldserver.conf` stops **players** rolling the
+  nine WotLK classes – the bots do not need it (`AiPlayerbot.CoaClassesOnly` keeps them on CoA
+  classes on their own).
+* Removing the bots again:
+  `cd /opt/azerothcore && rm -rf modules/mod-playerbots && FULL=1 bash /root/coa-update.sh`
+  (the `acore_playerbots` database and the bot characters stay, nothing uses them any more).
 
 ---
 
@@ -254,6 +351,12 @@ The database root password lives in `/opt/azerothcore/.env`
 | `coa-update.sh` looks frozen after `Starting worldserver ...` | `docker compose up` is waiting for a dependency (`ac-database` healthy, `ac-db-import` / `ac-client-data-init` completed) or the worldserver is in a crash loop. Current scripts report progress every 15 s, stop after 5 / 7 minutes and print the `ac-*` container states plus the last 30 log lines. Older copies polled the port for 4 minutes without any output. Manual check: `cd /opt/azerothcore && docker compose ps -a`, `docker logs --tail 50 ac-worldserver`, `docker logs --tail 20 ac-client-data-init`, `df -h /` |
 | Worldserver restart loop, log: `Could not connect to MySQL database at ac-database: Unknown MySQL server host 'ac-database' (-3)` + `DatabasePool Login NOT opened` | MySQL error `-3` is `CR_UNKNOWN_HOST`, so the container cannot resolve the compose service name – **no database or image damage**. Check the database side with `bash /root/check-db-access.sh` (read-only: databases, MySQL users, a real login over the compose network) and repair the container side with `bash /root/fix-container-dns.sh`: it prints the facts (resolv.conf, networks, DNS aliases, `daemon.json`), probes the name with a throwaway container in the same network and then applies the smallest fix – restart the application containers, or recreate the stack so all containers share one network with a fresh resolver configuration and re-registered DNS aliases. Only if that is not enough does it remove a custom `"dns"` entry from `/etc/docker/daemon.json` (backup kept) and restart the Docker daemon. Data stays in the volumes. |
 | Vanity items: "has no AzerothCore item template yet" | CoA world data missing → import the CoA dump (`COA_WORLD_DUMP`) |
+| Worldserver log is flooded with `> Config: Missing property <KEY> in config file ... or module config` and `Config::LoadFile: Duplicate key name '<KEY>'` | The core loads `env/dist/etc/modules/<name>.conf` **only** – a module config that was never copied from its `.conf.dist` is not loaded at all, so every config key that module reads logs one warning per read (this server: 92 839 lines in one day from `mod-coa-challenges` and `mod-dynamic-xp`, because older `coa-oneclick.sh` copies activated three hard-coded modules). Neither message is an error – the hardcoded code default was used – but they bury real errors. Fix: `python3 /root/fix-config-warnings.py` – it activates every missing module config, keeps the value that was in effect for keys whose `.dist` default differs, removes the duplicate keys from `worldserver.conf` (the first definition is the one that counts), restarts the worldserver and verifies both message types are gone. Use `--dry-run` to see the report without writing anything. |
+
+| Bots are missing in the game (no `.playerbots` command) | `bash /root/enable-playerbots.sh --status` shows the three parts: the module, the image and the database. Missing image → `cd /opt/azerothcore && docker compose build`; missing database → `bash /root/enable-playerbots.sh --db`; module not installed → `bash /root/enable-playerbots.sh` |
+| Worldserver restart loop, log: `DatabasePool Playerbots NOT opened` | the module is compiled into the image, but `acore_playerbots` does not exist (hand-made `docker compose build` before `enable-playerbots.sh`) → `bash /root/enable-playerbots.sh --db` |
+| Log: `> AUTOUPDATER: Automatic database updates are disabled for all databases in the config!` (logger `server.playerbots`) | expected in this deployment: the bot database is maintained from the host (see [Player bots](#player-bots-optional)), the module's own updater has no sources in the runtime image |
+| Bots log in very slowly / the server lags with many bots | `PLAYERBOTS_COUNT` is too high for the machine (200 ≈ 3.5 GB, 1000 ≈ 10 GB) and `MapUpdate.Threads` too low – `bash /root/enable-playerbots.sh --config` after a `PLAYERBOTS_COUNT=... PLAYERBOTS_MAP_THREADS=...` change |
 
 ---
 
@@ -307,10 +410,11 @@ cd /opt/azerothcore && docker compose up ac-db-import
 
 | File | Purpose |
 |---|---|
-| `coa-oneclick.sh` | full deployment (idempotent, safe to re-run) |
-| `coa-update.sh` | update: repo + core fixes + SQL updates + rebuild + restart |
-| `apply-missing-updates.sh` | applies repo SQL updates to auth/characters/world (SHA1 + state exactly like AC) |
-| `check-repo-updates.sh` | read-only check: which repo updates are not registered yet |
+| `coa-oneclick.sh` | full deployment (idempotent, safe to re-run); `WITH_PLAYERBOTS=1` installs the bots as well |
+| `coa-update.sh` | update: repo + core fixes + SQL updates + rebuild + restart (keeps the bot module in sync) |
+| `enable-playerbots.sh` | optional player bots: module + config + `acore_playerbots` + rebuild (`--prepare` / `--config` / `--db` / `--status`) |
+| `apply-missing-updates.sh` | applies repo SQL updates to auth/characters/world – and to playerbots when the module is installed (SHA1 + state exactly like AC) |
+| `check-repo-updates.sh` | read-only check: which repo updates are not registered yet (all four databases) |
 | `docker-compose.override.yml` | disables the auto-updater for CoA world data + log rotation |
 | `fix-build-network.sh` | repairs container DNS/IPv6 so image builds can reach the apt mirrors |
 | `fix-container-dns.sh` | repairs container DNS/network when the worldserver cannot resolve `ac-database` (error -3) |
@@ -318,6 +422,7 @@ cd /opt/azerothcore && docker compose up ac-db-import
 | `patches/db-<db>/*.sql` | project patches for tables the core/module code needs but upstream never shipped as SQL |
 | `transfer-data.sh` | copies the CoA world dump + client data from another server |
 | `check-dbc-rows.py` | verifies the CoA client DBC set the core requires (5 rows) |
+| `fix-config-warnings.py` | activates every module config, removes duplicate keys, verifies the worldserver log is free of config warnings |
 | `README.md` | this guide |
 
 ---
@@ -333,7 +438,8 @@ the repository is reconciled against the databases, so that all commits after th
 | `data/sql/archive/db_<db>` | ARCHIVED | pass 1 |
 | `data/sql/custom/db_<db>` | CUSTOM | pass 2 |
 | `data/sql/updates/pending_db_<db>` | PENDING | pass 2 |
-| `modules/*/data/sql/db-<db>` | MODULE | pass 2 |
+| `modules/*/data/sql/*<db>*` (recursive: `db-world` as well as mod-playerbots' `data/sql/world`) | MODULE | pass 2 |
+| `modules/mod-playerbots/data/sql/playerbots/{updates,archive,custom}` | RELEASED / ARCHIVED / CUSTOM | pass 1 / 2 |
 | `patches/db-<db>` (next to the scripts) | MODULE | pass 2 |
 
 `<db>` is `auth`, `characters` or `world` – each is routed to `acore_auth`, `acore_characters` or

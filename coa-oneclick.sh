@@ -6,6 +6,7 @@
 #    1. Base: Docker + Compose (installed if missing) + swap file
 #    2. Repo: clone/update /opt/azerothcore + apply the build fix
 #    3. Config: write .env (random DB password), activate module configs
+#    3b. Optional: player bots (WITH_PLAYERBOTS=1 -> module + acore_playerbots)
 #    4. Client data: from archive/folder (CLIENT_DATA) or download v20.0
 #    5. Images: docker compose build
 #    6. Database: import only the acore_world part of a CoA dump, disable the
@@ -21,6 +22,10 @@
 #    COA_WORLD_DUMP=/root/databases.sql.gz CLIENT_DATA=/root/Data.rar \
 #    GM_ACCOUNT=MyName:MyPass:3 bash coa-oneclick.sh
 #
+#  Player bots (optional, can also be added later with enable-playerbots.sh):
+#    WITH_PLAYERBOTS=1 bash coa-oneclick.sh
+#    PLAYERBOTS_COUNT=200 WITH_PLAYERBOTS=1 bash coa-oneclick.sh
+#
 #  Environment variables (all optional):
 #    AC_DIR=/opt/azerothcore            PUBLIC_IP=<auto-detected>
 #    DB_ROOT_PASSWORD=<random when empty>
@@ -29,6 +34,9 @@
 #    COA_WORLD_DUMP=<.sql/.sql.gz>      CLIENT_DATA=<.rar/.zip/folder>
 #    GM_ACCOUNT=<user:pass[:level]>
 #    FORCE_BUILD=0 FORCE_IMPORT=0 FORCE_CLIENT_DATA=0 FORCE_CONFIG=0 SKIP_SWAP=0
+#    WITH_PLAYERBOTS=0                  (1 = install the player bots as well)
+#    PLAYERBOTS_COUNT=200 PLAYERBOTS_AUTOLOGIN=1 PLAYERBOTS_MAP_THREADS=8
+#    PLAYERBOTS_REPO=... PLAYERBOTS_BRANCH=coa PLAYERBOTS_REF=<tag/commit>
 # ============================================================================
 
 set -uo pipefail
@@ -55,6 +63,8 @@ FORCE_CLIENT_DATA="${FORCE_CLIENT_DATA:-0}"
 FORCE_CONFIG="${FORCE_CONFIG:-0}"
 SKIP_SWAP="${SKIP_SWAP:-0}"
 SWAP_SIZE="${SWAP_SIZE:-4G}"
+# Optional player bots (mod-playerbots, CoA fork) - see enable-playerbots.sh
+WITH_PLAYERBOTS="${WITH_PLAYERBOTS:-0}"
 
 DATA_VOL="azerothcore_ac-client-data"
 
@@ -250,6 +260,22 @@ EOF
     ok ".env written (DB port ${DB_EXTERNAL_PORT} -> no conflict with host MariaDB)"
 fi
 
+# -------------------------------------------------- 3b. Player bots (opt.)
+# WITH_PLAYERBOTS=1 installs the optional playerbot module in the same run:
+# the module has to be cloned before the image build (the worldserver compiles
+# it in) and its config is created here so step 7 only has to keep it. The
+# database (acore_playerbots) is created in step 6b - before the first start.
+if [ "$WITH_PLAYERBOTS" = "1" ]; then
+    step "3b/9  Player bots (mod-playerbots, optional)"
+    if [ -f "$SELF_DIR/enable-playerbots.sh" ]; then
+        AC_DIR="$AC_DIR" bash "$SELF_DIR/enable-playerbots.sh" --prepare \
+            || die "Playerbots setup failed (see the output above)"
+    else
+        warn "enable-playerbots.sh not found next to this script - player bots are skipped"
+        WITH_PLAYERBOTS=0
+    fi
+fi
+
 # ------------------------------------------------------------ 4. Client data
 step "4/9  Client data"
 DOCKER_ROOT="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)"
@@ -315,6 +341,11 @@ step "5/9  Docker images"
 NEED_BUILD=1
 if docker image inspect "acore/ac-wotlk-worldserver:${IMAGE_TAG}" >/dev/null 2>&1; then NEED_BUILD=0; fi
 [ "$FORCE_BUILD" = "1" ] && NEED_BUILD=1
+# the playerbot module has to be compiled in, even when an image already exists
+if [ "$WITH_PLAYERBOTS" = "1" ]; then
+    log "Player bots requested -> image rebuild is forced (the module must be compiled in)"
+    NEED_BUILD=1
+fi
 if [ "$NEED_BUILD" = "1" ]; then
     # Network preflight: on a fresh VPS the build often fails because a container
     # cannot reach the apt mirrors (broken IPv6 or a DNS stub). Takes up to ~2 min.
@@ -432,6 +463,18 @@ else
     [ -f docker-compose.override.yml ] && warn "Note: docker-compose.override.yml exists and disables ac-db-import"
 fi
 
+# ---------------------------------------------------- 6b. Player bots (opt.)
+# acore_playerbots is the module's own database. mod-playerbots normally fills
+# it at worldserver startup, but the runtime image contains no module sources
+# (only the db-import image gets data/ + modules/), so this deployment keeps the
+# module updater off and imports the base data + the module updates from the
+# host - the same place where auth/characters/world updates are applied.
+if [ "$WITH_PLAYERBOTS" = "1" ] || [ -d "$AC_DIR/modules/mod-playerbots" ]; then
+    step "6b/9  Player bots: acore_playerbots"
+    AC_DIR="$AC_DIR" bash "$SELF_DIR/enable-playerbots.sh" --db \
+        || warn "Playerbots database setup reported errors - bots may stay offline"
+fi
+
 # ------------------------------------- 7. Module and server configuration
 step "7/9  Module and server configuration"
 cd "$AC_DIR"
@@ -445,14 +488,24 @@ if [ ! -f "$ETC/worldserver.conf.dist" ]; then
 fi
 [ -f "$ETC/worldserver.conf.dist" ] && ok "Config templates present" || warn "Templates missing (created on first start)"
 
-for m in mod_ascension_compat mod_teleport_actionbar coa_bugreport; do
-    if [ -f "$ETC/modules/$m.conf" ]; then
-        ok "Module config active: $m.conf"
-    elif [ -f "$ETC/modules/$m.conf.dist" ]; then
-        cp "$ETC/modules/$m.conf.dist" "$ETC/modules/$m.conf"
-        ok "Module config activated: $m.conf"
+# The core loads <name>.conf only, never the .conf.dist template. A template that
+# was never copied means the module is not configured at all: every key it reads
+# falls back to the code default and writes
+#   "> Config: Missing property <KEY> in config file ... or module config"
+# to the log - on every read, which is tens of thousands of lines per day. So do
+# not list three modules here (that is exactly how mod-coa-challenges and
+# mod-dynamic-xp were missed and flooded the log) - activate every template.
+for dist in "$ETC"/modules/*.conf.dist; do
+    if [ ! -e "$dist" ]; then
+        warn "No module config templates found in $ETC/modules"
+        break
+    fi
+    conf="${dist%.dist}"
+    if [ -f "$conf" ]; then
+        ok "Module config active: $(basename "$conf")"
     else
-        warn "Module config template missing: $m.conf.dist"
+        cp "$dist" "$conf"
+        ok "Module config activated: $(basename "$conf")"
     fi
 done
 
@@ -464,6 +517,14 @@ if [ -f "$ACA" ]; then
     grep -q '^AscensionCompat.AllowRemoteClients = 1' "$ACA" \
         && ok "AscensionCompat: AllowRemoteClients=1 + absolute DBC path set" \
         || warn "Please check the AscensionCompat config: $ACA"
+fi
+# Player bots (optional): keep the values this deployment manages (CoA zone
+# channel, Ascension world channel, database, bot count) and MapUpdate.Threads
+# in sync. Runs whenever the module is installed - also on a later re-run of
+# this script on an existing server.
+if [ -f "$SELF_DIR/enable-playerbots.sh" ] && [ -d "$AC_DIR/modules/mod-playerbots" ]; then
+    AC_DIR="$AC_DIR" bash "$SELF_DIR/enable-playerbots.sh" --config \
+        || warn "playerbots.conf sync reported errors - please check the output above"
 fi
 chown -R 1000:1000 "$ETC" 2>/dev/null || true
 
@@ -498,33 +559,23 @@ log "Waiting for the worldserver ..."
 wait_init && ok "Worldserver is up" || warn "Not detected - check: docker logs ac-worldserver"
 
 WSC="env/dist/etc/worldserver.conf"
-if [ -f "$WSC" ] && ! grep -q 'coa-oneclick.sh additions' "$WSC"; then
+if [ -f "$WSC" ] && ! grep -q -e 'coa-oneclick.sh additions' -e 'coa-oneclick.sh Ergaenzungen' "$WSC"; then
     log "Adding missing options to worldserver.conf"
+    # a file that ends without a newline would glue the first appended line onto
+    # the last existing one
+    [ -n "$(tail -c 1 "$WSC")" ] && printf '\n' >> "$WSC"
     cat >> "$WSC" <<'EOF'
 
 #
 # ---------------------------------------------------------------------------
-# coa-oneclick.sh additions (these keys are missing in this fork's .dist)
+# coa-oneclick.sh additions / Ergaenzungen
 # ---------------------------------------------------------------------------
-Cluster.Enabled = 0
-MinWorldUpdateTime = 1
-MaxCoreStuckTime = 60
-BeepAtStart = 1
-Network.UseSocketActivation = 0
-
-TeleportActionBar.Enable = 1
-TeleportActionBar.CastFromItem = 1
-TeleportActionBar.EnforceFaction = 1
-TeleportActionBar.OnLogin = 0
-TeleportActionBar.OnLearnSpell = 0
-TeleportActionBar.OnSpecChange = 0
-TeleportActionBar.LearnCarriedTokens = 0
-TeleportActionBar.LearnCarriedTokensFromBank = 0
-TeleportActionBar.MaxButtons = 24
-TeleportActionBar.FirstButton = 0
-TeleportActionBar.LastButton = 143
-TeleportActionBar.ItemNameFilter = "Stone of Retreat%"
-
+# Only keys that no config of this fork defines belong here. Keys a module
+# config already handles (TeleportActionBar.*, CoAChallenges.*, Dynamic.XP.*)
+# belong in env/dist/etc/modules/<module>.conf: a second definition is logged as
+# "Config::LoadFile: Duplicate key name ..." and the first value wins anyway.
+# The Ascension-compat self test is off (code default = false); this line only
+# documents that.
 CoAGameplayTest.Enable = 0
 EOF
     chown 1000:1000 "$WSC" 2>/dev/null || true
@@ -605,6 +656,12 @@ printf "DB root passw. : %s\n" "$( [ -f /root/coa-db-password.txt ] && echo 'see
 printf "Accounts       : %s\n" "$(mysql_q "SELECT COUNT(1) FROM account" acore_auth | head -1)"
 printf "Errors in log  : %s\n" "$(docker logs --since 30m ac-worldserver 2>&1 | grep -ac -i error)"
 printf "Disk           : %s\n" "$(df -h / | awk 'NR==2 {print $4 " free (" $5 " used)"}')"
+if [ -d "$AC_DIR/modules/mod-playerbots" ]; then
+    printf "Player bots    : installed (%s) - details: bash enable-playerbots.sh --status\n" \
+        "$(git -C "$AC_DIR/modules/mod-playerbots" rev-parse --short HEAD 2>/dev/null || echo '?')"
+else
+    printf "Player bots    : not installed (optional) - add them later: bash enable-playerbots.sh\n"
+fi
 echo
 printf "Client: realmlist.wtf -> set realmlist %s\n" "${REALM_IP:-<server-ip>}"
 printf "Ports : %s (auth), %s (world), %s (SOAP)\n" "$AUTH_PORT" "$WORLD_PORT" "$SOAP_PORT"

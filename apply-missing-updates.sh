@@ -2,17 +2,27 @@
 # ===========================================================================
 #  apply-missing-updates.sh
 #  Applies SQL updates from the repo to the matching databases
-#  (auth / characters / world). Typical case: a CoA world dump was imported
-#  and the AzerothCore auto-updater is disabled.
+#  (auth / characters / world - plus acore_playerbots when the optional
+#  mod-playerbots module is installed). Typical case: a CoA world dump was
+#  imported and the AzerothCore auto-updater is disabled.
 #
 #  Routing by source folder (= AzerothCore table `updates_include`):
 #    data/sql/updates/db_<db>         -> <db>  RELEASED   (apply pass 1)
 #    data/sql/archive/db_<db>         -> <db>  ARCHIVED   (apply pass 1)
 #    data/sql/custom/db_<db>          -> <db>  CUSTOM     (apply pass 2)
 #    data/sql/updates/pending_db_<db> -> <db>  PENDING    (apply pass 2)
-#    modules/*/data/sql/db-<db>       -> <db>  MODULE     (apply pass 2)
+#    modules/*/data/sql/*<db>*        -> <db>  MODULE     (apply pass 2)
 #    patches/db-<db>                  -> <db>  MODULE     (apply pass 2)
 #  (data/sql/manual/ and *.sh are ignored - these are manual tools)
+#
+#  Optional mod-playerbots (installed by enable-playerbots.sh):
+#    modules/mod-playerbots/data/sql/playerbots/updates -> acore_playerbots RELEASED
+#    modules/mod-playerbots/data/sql/playerbots/archive -> acore_playerbots ARCHIVED
+#    modules/mod-playerbots/data/sql/playerbots/custom  -> acore_playerbots CUSTOM
+#    modules/mod-playerbots/data/sql/world|characters   -> acore_world / acore_characters
+#  The module base data (names, texts, travel nodes) is imported once by
+#  `enable-playerbots.sh --db`, not here - just like the CoA world dump
+#  provides the world base data.
 #
 #  Application order mirrors UpdateFetcher::Update():
 #    pass 1: RELEASED + ARCHIVED       - sorted byte-wise by file name
@@ -21,6 +31,12 @@
 #  Registration matches AzerothCore exactly:
 #    name = file name including .sql, hash = SHA1 UPPERCASE, state as above.
 #  Duplicate key means "content already present" -> registered as applied.
+#
+#  Options:
+#    DRY=1          list what would be applied, write nothing
+#    DEBUG_ORDER=1  print the application order + state counts
+#    NO_START=1     do not start the worldserver at the end (enable-playerbots.sh
+#                   uses this during a deployment)
 # ===========================================================================
 
 set -uo pipefail
@@ -163,15 +179,44 @@ for db in auth characters world; do
     collect PENDING  "acore_$db" "$REPO/data/sql/updates/pending_db_$db"
 done
 
-# Module SQL: any module directory named db-auth / db-characters / db-world
-while IFS= read -r mdir; do
-    case "$(basename "$mdir")" in
-        db-auth)       collect MODULE acore_auth       "$mdir" ;;
-        db-characters) collect MODULE acore_characters "$mdir" ;;
-        db-world)      collect MODULE acore_world      "$mdir" ;;
+# Module SQL for the core databases: AzerothCore adds every directory directly
+# below modules/<module>/data/sql/ whose name contains the database part
+# (DBUpdater::GetDBModuleName + the substring match in UpdateFetcher: "auth",
+# "characters", "world"). The classic db-world/db-characters/db-auth naming
+# matches this too, but the old db-<name> glob missed mod-playerbots, which
+# ships data/sql/world and data/sql/characters.
+for mdir in "$REPO"/modules/*/data/sql/*/; do
+    [ -d "$mdir" ] || continue
+    case "$(basename "${mdir%/}")" in
+        *auth*)       collect MODULE acore_auth       "${mdir%/}" ;;
+        *characters*) collect MODULE acore_characters "${mdir%/}" ;;
+        *world*)      collect MODULE acore_world      "${mdir%/}" ;;
     esac
-done < <(find "$REPO/modules" -type d \
-            \( -name db-auth -o -name db-characters -o -name db-world \) 2>/dev/null)
+done
+
+# --- Optional mod-playerbots ----------------------------------------------
+# The module registers its own include paths in acore_playerbots.updates_include
+# ($/data/sql/playerbots/{updates,custom,archive} with $ = the module directory),
+# so exactly these directories/states are the ones the worldserver would use.
+# The base data (names, texts, travel nodes) is imported once by
+# `enable-playerbots.sh --db` - a script cannot replace the base of a filled DB.
+DBS="acore_auth acore_characters acore_world"
+PB_SQL="$REPO/modules/mod-playerbots/data/sql/playerbots"
+PLAYERBOTS_DB=""
+if [ ! -f "$PB_SQL/base/updates.sql" ]; then
+    echo "Playerbots module   : not installed (optional) - install with enable-playerbots.sh"
+elif [ "$(docker exec -i ac-database mysql -uroot -p"$PW" -N -B -e \
+           "SELECT COUNT(1) FROM information_schema.tables WHERE table_schema='acore_playerbots'" 2>/dev/null | head -1)" = "0" ]; then
+    echo "Playerbots module   : installed, but the database acore_playerbots does not exist"
+    echo "                      -> bash $SCRIPT_DIR/enable-playerbots.sh --db"
+else
+    collect RELEASED acore_playerbots "$PB_SQL/updates"
+    collect ARCHIVED acore_playerbots "$PB_SQL/archive"
+    collect CUSTOM   acore_playerbots "$PB_SQL/custom"
+    DBS="$DBS acore_playerbots"
+    PLAYERBOTS_DB="acore_playerbots"
+    echo "Playerbots module   : acore_playerbots is included (updates/archive/custom)"
+fi
 
 # Project patches: SQL shipped with this deployment repo in patches/db-<db>/.
 # Needed when upstream ships code that reads a table without shipping the SQL
@@ -186,7 +231,7 @@ done
 #   pass 2: PENDING + CUSTOM + MODULE - sorted byte-wise by file name
 #   (C++ compares std::string byte-wise, therefore LC_ALL=C.)
 : > "$ORDERED"
-for db in acore_auth acore_characters acore_world; do
+for db in $DBS; do
     awk -F'|' -v d="$db" '$2==d && ($1=="RELEASED" || $1=="ARCHIVED") {n=split($3,a,"/"); print a[n]"|"$1"|"$2"|"$3}' "$LIST" \
         | LC_ALL=C sort -t'|' -k1,1 | cut -d'|' -f2- >> "$ORDERED"
     awk -F'|' -v d="$db" '$2==d && ($1=="PENDING" || $1=="CUSTOM" || $1=="MODULE") {n=split($3,a,"/"); print a[n]"|"$1"|"$2"|"$3}' "$LIST" \
@@ -194,10 +239,11 @@ for db in acore_auth acore_characters acore_world; do
 done
 
 echo "Update files in repo : $(wc -l < "$LIST")"
-printf "  auth=%s  characters=%s  world=%s\n" \
+printf "  auth=%s  characters=%s  world=%s  playerbots=%s\n" \
     "$(grep -c '|acore_auth|' "$LIST")" \
     "$(grep -c '|acore_characters|' "$LIST")" \
-    "$(grep -c '|acore_world|' "$LIST")"
+    "$(grep -c '|acore_world|' "$LIST")" \
+    "$(grep -c '|acore_playerbots|' "$LIST")"
 printf "  by state: RELEASED=%s  ARCHIVED=%s  CUSTOM=%s  PENDING=%s  MODULE=%s\n" \
     "$(grep -c '^RELEASED|' "$LIST")" \
     "$(grep -c '^ARCHIVED|' "$LIST")" \
@@ -214,7 +260,7 @@ REG="/tmp/coa_registered.txt"
 HASHES="/tmp/coa_hashes.txt"
 ACTIONS="/tmp/coa_actions.txt"
 : > "$REG"
-for db in acore_auth acore_characters acore_world; do
+for db in $DBS; do
     docker exec -i ac-database mysql -uroot -p"$PW" "$db" -N -B \
         -e "SELECT CONCAT(name, '|', IFNULL(hash,'')) FROM updates" 2>/dev/null \
         > "/tmp/coa_db_$db.txt"
@@ -251,7 +297,7 @@ fi
 
 # --- 3) Backup + stop worldserver ----------------------------------------
 echo "Backing up updates tables ..."
-for db in acore_auth acore_characters acore_world; do
+for db in $DBS; do
     docker exec -i ac-database mysqldump -uroot -p"$PW" "$db" updates \
         > "/root/updates_backup_$db.sql" 2>/dev/null
     printf "  -> /root/updates_backup_%s.sql (%s lines)\n" "$db" "$(wc -l < "/root/updates_backup_$db.sql")"
@@ -310,7 +356,9 @@ printf "  errors         : %s\n" "$FAILED"
 # therefore looked exactly like a frozen script. Now the output is kept, the wait
 # is limited to 5 minutes and a stack that does not come up is reported with its
 # container states and the last log lines instead of endless silence.
-if ! ws_running; then
+if [ "${NO_START:-0}" = "1" ]; then
+    echo "NO_START=1: the worldserver is not started here (the caller does that)"
+elif ! ws_running; then
     echo "Starting worldserver ..."
     COMPOSE_LOG="/tmp/coa_compose_up_ac-worldserver.log"
     rc=0
@@ -323,6 +371,8 @@ if ! ws_running; then
 else
     echo "Worldserver container already running - waiting for it to finish loading."
 fi
-ws_wait 420 || true
-printf "Worldserver port %s active: %s\n" "$WORLD_PORT" "$(port_open "$WORLD_PORT" && echo yes || echo no)"
+if [ "${NO_START:-0}" != "1" ]; then
+    ws_wait 420 || true
+    printf "Worldserver port %s active: %s\n" "$WORLD_PORT" "$(port_open "$WORLD_PORT" && echo yes || echo no)"
+fi
 echo "=== $(date '+%F %T') end ==="
