@@ -73,6 +73,12 @@ EVIDR = re.compile(r'Config:\s*Missing property (\S+) in config file .*?, add "(
 # Both are searched over the whole file, because the call can span several lines.
 GETOPT = re.compile(r'GetOption\s*<\s*[^>]*>\s*\(\s*"([^"]+)"', re.S)
 SETCFG = re.compile(r'SetConfigValue\s*<\s*[^>]*>\s*\(\s*[^,"()]*\s*,\s*"([^"]+)"', re.S)
+# the same two calls, but capturing the default argument (used to detect where a
+# module .conf.dist ships a value that differs from the hardcoded code default)
+GETOPT_DEFAULT = re.compile(r'GetOption\s*<\s*[^>]*>\s*\(\s*"([^"]+)"\s*,\s*([^,)]*?)\s*[,)]', re.S)
+SETCFG_DEFAULT = re.compile(
+    r'SetConfigValue\s*<\s*[^>]*>\s*\(\s*[^,"()]*\s*,\s*"([^"]+)"\s*,\s*([^,)]*?)\s*[,)]', re.S)
+DEFAULT_LITERAL = re.compile(r'^(?:true|false|-?\d+(?:\.\d+)?f?|"[^"]*"|\'[^\']*\')$', re.I)
 # directories whose keys belong to another binary (unit tests, dbimport tool)
 NOT_WORLDSERVER_DIRS = ("test", "tests", "tools", "deps", "env", "build", ".git")
 DEFAULT_WAIT = 60
@@ -246,7 +252,7 @@ def sync_templates_from_image(ac_dir, etc, dry_run):
     return fetched
 
 
-def activate_module_configs(etc, evidence, dry_run):
+def activate_module_configs(etc, evidence, dry_run, ac_dir=None, keep_code_defaults=False):
     """Copy every module .conf.dist without a .conf and keep the values in effect."""
     dists = sorted(glob.glob(os.path.join(etc, "modules", "*.conf.dist")))
     if not dists:
@@ -255,6 +261,11 @@ def activate_module_configs(etc, evidence, dry_run):
         warn("templates are fetched from the image (needs docker + the worldserver image).")
         return []
     activated, present = [], []
+    # the hardcoded defaults are needed to show where a .conf.dist changes behaviour
+    code_defaults = scan_code_defaults(ac_dir) if ac_dir else None
+    if code_defaults is not None:
+        print("      code defaults known for %d key(s) (literal defaults only)"
+              % len(code_defaults))
     for dist in dists:
         target = dist[:-5]
         if os.path.exists(target):
@@ -272,40 +283,63 @@ def activate_module_configs(etc, evidence, dry_run):
         print("      every module .conf.dist already has an active .conf")
 
     for target in activated:
-        apply_evidence_to_conf(target, evidence, dry_run)
+        apply_evidence_to_conf(target, evidence, dry_run, code_defaults, keep_code_defaults)
     return activated
 
 
-def apply_evidence_to_conf(target, evidence, dry_run):
-    """Keep the value that was in effect for keys whose .dist default differs."""
-    if not evidence:
-        return 0
+def apply_evidence_to_conf(target, evidence, dry_run, code_defaults=None,
+                           keep_code_defaults=False):
+    """Align a freshly activated config with what was in effect before.
+
+    - a key the log reported keeps the value that was in effect (the warning
+      disappears, nothing else changes),
+    - a key whose .conf.dist value differs from the hardcoded code default is
+      reported (activating the config would change behaviour) and, with
+      --keep-code-defaults, kept at the code default as well,
+    - every other key keeps the .conf.dist value, which is the upstream default.
+    """
     path = target if os.path.exists(target) else target + ".dist"
-    edits = [(index, key, value, evidence[key]) for index, key, value in cfg_keys(path)
-             if key in evidence and norm(evidence[key]) != norm(value)]
-    if not edits:
+    if not os.path.exists(path):
         return 0
-    print("      %s: %d key(s) differ, keeping the value in effect:"
-          % (os.path.basename(target), len(edits)))
-    for _, key, dist_value, effective in edits:
-        print("         %-44s .dist %s -> kept %s" % (key, dist_value, effective))
-    if dry_run:
-        return len(edits)
-    by_index = {index: (key, dist_value, effective)
-                for index, key, dist_value, effective in edits}
+
+    writes = {}       # line index -> (key, value, reason)
+    reported = []
+    for index, key, value in cfg_keys(path):
+        if evidence and key in evidence and norm(evidence[key]) != norm(value):
+            writes[index] = (key, evidence[key], "kept at the value that was in effect")
+        elif code_defaults is not None and norm(value) != code_defaults.get(key):
+            if key in code_defaults:
+                reported.append((key, value, code_defaults[key]))
+                if keep_code_defaults:
+                    writes[index] = (key, code_defaults[key], "kept at the code default")
+
+    if reported:
+        print("      %s: %d key(s) where the template ships another value than the"
+              % (os.path.basename(target), len(reported)))
+        print("      %s  hardcoded code default - that IS the upstream default:" % "")
+        for key, value, default in reported:
+            mark = "-> keep %s" % default if keep_code_defaults else ""
+            print("         %-44s .dist %s, code default %s  %s" % (key, value, default, mark))
+    if writes:
+        print("      %s: %d key(s) stay at the value they had until now:"
+              % (os.path.basename(target), len(writes)))
+        for key, value, reason in writes.values():
+            print("         %-44s -> %s  (%s)" % (key, value, reason))
+    if dry_run or not writes:
+        return len(writes)
+
     out = []
     for index, line in enumerate(read(path)):
-        if index in by_index:
-            key, dist_value, effective = by_index[index]
+        if index in writes:
+            key, value, reason = writes[index]
             out.append("")
-            out.append("# kept at the value that was in effect before this module config")
-            out.append("# existed (the hardcoded code default). This fork's .dist "
-                       "default is: %s" % dist_value)
-            out.append("%s = %s" % (key, effective))
+            out.append("# %s - this module config did not exist before, so the key" % reason)
+            out.append("# kept a different value than the one in the .conf.dist")
+            out.append("%s = %s" % (key, value))
         else:
             out.append(line)
     write(path, out)
-    return len(edits)
+    return len(writes)
 
 
 def dedupe_worldserver_conf(world_conf, dry_run):
@@ -385,6 +419,35 @@ def scan_code_keys(ac_dir):
     return code
 
 
+def scan_code_defaults(ac_dir):
+    """{key: default} for keys whose hardcoded default is a plain literal.
+
+    Expressions (`MAX_ACTION_BUTTONS - 1`), constants and hex are skipped: they
+    cannot be compared with a config value. What is left is exactly the set of
+    keys where activating a module config could change the running behaviour
+    (the code default was in effect until now).
+    """
+    defaults = {}
+    roots = []
+    core_src = os.path.join(ac_dir, "src")
+    if os.path.isdir(core_src):
+        roots.append(core_src)
+    roots += sorted(glob.glob(os.path.join(ac_dir, "modules", "*", "src")))
+    for root_dir in roots:
+        for root, dirs, files in os.walk(root_dir):
+            dirs[:] = [d for d in dirs if d not in NOT_WORLDSERVER_DIRS]
+            for name in files:
+                if not name.endswith((".cpp", ".h", ".inc", ".inl")):
+                    continue
+                text = "\n".join(read(os.path.join(root, name)))
+                for pattern in (GETOPT_DEFAULT, SETCFG_DEFAULT):
+                    for match in pattern.finditer(text):
+                        raw = re.split(r"\s+#", match.group(2), maxsplit=1)[0].strip()
+                        if DEFAULT_LITERAL.match(raw):
+                            defaults.setdefault(match.group(1), norm(raw))
+    return defaults
+
+
 def defined_keys(path):
     """Keys an existing config file (or .conf.dist) defines."""
     if not os.path.exists(path):
@@ -441,7 +504,8 @@ def target_conf(ac_dir, etc, world_conf, key, owner):
     return best, best_dist
 
 
-def activate_from_dist(target, dist, evidence, dry_run):
+def activate_from_dist(target, dist, evidence, dry_run, code_defaults=None,
+                       keep_code_defaults=False):
     """Create <target> from its template and keep the values that were in effect."""
     if os.path.exists(target):
         return True
@@ -454,11 +518,11 @@ def activate_from_dist(target, dist, evidence, dry_run):
     os.makedirs(os.path.dirname(target), exist_ok=True)
     shutil.copyfile(dist, target)
     os.chmod(target, 0o644)
-    apply_evidence_to_conf(target, evidence, dry_run)
+    apply_evidence_to_conf(target, evidence, dry_run, code_defaults, keep_code_defaults)
     return True
 
 
-def write_missing_keys(ac_dir, etc, world_conf, evidence, dry_run):
+def write_missing_keys(ac_dir, etc, world_conf, evidence, dry_run, keep_code_defaults=False):
     """Define the keys the log complains about, with the value that is in effect.
 
     The log line carries the value the code used ("... add \"KEY = VALUE\" to this
@@ -470,6 +534,7 @@ def write_missing_keys(ac_dir, etc, world_conf, evidence, dry_run):
     if not evidence:
         return 0
     code = scan_code_keys(ac_dir)
+    code_defaults = scan_code_defaults(ac_dir)
     targets = {}
     unfixable = []
     for key in sorted(evidence):
@@ -478,7 +543,8 @@ def write_missing_keys(ac_dir, etc, world_conf, evidence, dry_run):
         if target is None:
             unfixable.append((key, "no config of this fork defines a related key"))
             continue
-        if not activate_from_dist(target, dist, evidence, dry_run):
+        if not activate_from_dist(target, dist, evidence, dry_run, code_defaults,
+                                  keep_code_defaults):
             unfixable.append((key, "template %s is not available" % (dist or target)))
             continue
         targets.setdefault(target, []).append((key, evidence[key]))
@@ -663,6 +729,10 @@ def main():
     parser.add_argument("--log", default=None, help="use this log file as evidence instead of 'docker logs'")
     parser.add_argument("--dry-run", action="store_true", help="report only, change nothing")
     parser.add_argument("--no-restart", action="store_true", help="edit the configs, do not restart")
+    parser.add_argument("--keep-code-defaults", action="store_true",
+                        help="when a module config is activated, keep the hardcoded code default for "
+                             "keys where the .conf.dist ships a different value (default: use the "
+                             ".conf.dist value of the fork). Both cases are reported either way.")
     args = parser.parse_args()
 
     etc = args.etc or os.path.join(args.ac_dir, "env", "dist", "etc")
@@ -687,10 +757,12 @@ def main():
     print("      log lines scanned             : %d" % log_lines)
     print("      distinct keys reported missing: %d" % len(evidence))
 
-    activated = activate_module_configs(etc, evidence, args.dry_run)
+    activated = activate_module_configs(etc, evidence, args.dry_run, args.ac_dir,
+                                        args.keep_code_defaults)
     if activated:
         ok("%d module config(s) activated" % len(activated))
-    written = write_missing_keys(args.ac_dir, etc, world_conf, evidence, args.dry_run)
+    written = write_missing_keys(args.ac_dir, etc, world_conf, evidence, args.dry_run,
+                                 args.keep_code_defaults)
     if written:
         ok("%d key(s) that logged 'Missing property' are defined now" % written)
     dedupe_worldserver_conf(world_conf, args.dry_run)
