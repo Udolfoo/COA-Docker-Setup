@@ -138,6 +138,36 @@ ws_wait() {   # <max_seconds> -> 0 = up, 1 = not up (diagnostics printed)
     return 1
 }
 
+# ------------------------------------------------------- local modifications
+# The update checks out a new revision of the core; local modifications of
+# tracked files block that ("Your local changes ... would be overwritten").
+# This deployment's own build fixes (the mod-ascension-compat patches and the
+# quest-menu cap in src/) are re-applied right after the checkout, so they are
+# saved as a patch and dropped beforehand - nothing can be lost.
+# Every path is reset on its own: a single unknown path makes
+# "git checkout -- a b c" fail as a WHOLE (that is what happened when upstream
+# removed the whole mod-ascension-compat module), so nothing was reset and the
+# checkout aborted. Cleaning up here - before the fetch - makes the reset below
+# harmless even if it touches a path that no longer exists.
+coa_reset_local_changes() {
+    git diff --quiet 2>/dev/null && return 0
+    local patch="/root/coa-local-changes-$(date +%Y%m%d-%H%M%S).patch"
+    if git diff > "$patch" 2>/dev/null; then
+        log "local modifications saved to $patch"
+    else
+        warn "local modifications could not be saved to $patch"
+    fi
+    git status --porcelain --untracked-files=no | sed 's/^/      reset: /'
+    for p in src modules data conf; do
+        [ -e "$p" ] && git checkout -- "$p" 2>/dev/null || true
+    done
+    if ! git diff --quiet 2>/dev/null; then
+        warn "local modifications are still in place (the checkout below may fail):"
+        git status --porcelain --untracked-files=no | head -5 | sed 's/^/      /'
+    fi
+}
+coa_reset_local_changes
+
 BEFORE="$(git rev-parse HEAD)"
 step "1/5  Repository: checking for updates"
 git fetch --prune origin "$REPO_BRANCH" >/dev/null 2>&1 || die "git fetch failed"
