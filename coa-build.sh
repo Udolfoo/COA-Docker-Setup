@@ -261,6 +261,13 @@ report_ccache() {   # [--full]
     if [ "${1:-}" = "--full" ]; then
         if ensure_probe_image; then
             printf '\n  ccache statistics (counted since the mount was last empty):\n'
+            ccache_stats_output |
+                grep -E 'Cacheable|Hits|Misses|Cache size|Files|Errors|Uncacheable' |
+                sed 's/^/    /' | head -20
+            printf '    (100%% misses = the mount was empty when the last build started)\n'
+        fi
+    fi
+}
 
 # --------------------------------------------------------------- build flow
 preflight_network() {
@@ -306,7 +313,7 @@ do_build() {
 
     # 3) build (-cache stays on: ccache lives in the mount, not in the layers)
     [ "$FULL" = "1" ] && extra="--no-cache"
-    log "docker compose build ${extra:+(--no-cache)} - log: $BUILD_LOG"
+    log "docker compose build${extra:+ --no-cache} - log: $BUILD_LOG"
     log "  cold: 45-120 min | with a warm ccache: a few minutes"
     ( export DOCKER_BUILDKIT=1 BUILDKIT_PROGRESS=plain; docker compose build $extra ) \
         2>&1 | tee "$BUILD_LOG" || rc=1
@@ -327,15 +334,6 @@ do_build() {
     fi
     report_ccache
 }
-
-            ccache_stats_output |
-                grep -E 'Cacheable|Hits|Misses|Cache size|Files|Errors|Uncacheable' |
-                sed 's/^/    /' | head -20
-            printf '    (100%% misses = the mount was empty when the last build started)\n'
-        fi
-    fi
-}
-
 
 # ------------------------------------------------------------------ GC config
 # Docker's automatic build cache GC prunes "cache mounts" (its policy 1, they
