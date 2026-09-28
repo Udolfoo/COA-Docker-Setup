@@ -9,15 +9,33 @@
 # 2) Log rotation: keeps container logs from growing without limit
 #    (max. 20 MB x 3 files per service).
 #
+# 3) ccache settings for the image build - the compiler cache that keeps a
+#    rebuild at a few minutes instead of 45-120. The Dockerfile declares these
+#    as build args, which BuildKit passes to the RUN step as environment
+#    variables, and ccache reads them from there. The fork ships
+#    CCACHE_MAXSIZE="1000MB", which ccache 4.x rejects (it expects "1000M") and
+#    silently replaces with its 5 GB default - this makes it explicit.
+#    Keep the values IDENTICAL for every service: the compile stage is shared,
+#    two different values would compile the world twice.
+#
 # Note: coa-oneclick.sh / coa-update.sh write this file automatically when a
 #       CoA world dump was imported.
 # ===========================================================================
 
+x-coa-ccache: &coa-ccache
+  CCACHE_MAXSIZE: "5G"
+  CCACHE_COMPRESS: "true"
+  CCACHE_COMPRESSLEVEL: "9"
+
 services:
   ac-db-import:
     entrypoint: ["/bin/sh", "-c", "echo 'ac-db-import disabled: acore_world comes from the CoA dump'; exit 0"]
+    build:
+      args: *coa-ccache
 
   ac-worldserver:
+    build:
+      args: *coa-ccache
     logging:
       driver: json-file
       options:
@@ -25,6 +43,8 @@ services:
         max-file: "3"
 
   ac-authserver:
+    build:
+      args: *coa-ccache
     logging:
       driver: json-file
       options:

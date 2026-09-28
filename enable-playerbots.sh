@@ -572,22 +572,17 @@ if [ "$MODE" = "all" ]; then
     if [ "$SKIP_BUILD" = "1" ]; then
         warn "build skipped (SKIP_BUILD=1) - the bots stay inactive until the module is compiled in"
     else
-        # A fresh VPS often fails here: a build container cannot reach the apt
-        # mirrors (broken IPv6 or a DNS stub). Same preflight as coa-update.sh.
-        if [ -f "$SCRIPT_DIR/fix-build-network.sh" ]; then
-            log "Network preflight: checking container DNS/IPv6 (hard limit 5 minutes) ..."
-            timeout 300 bash "$SCRIPT_DIR/fix-build-network.sh" \
-                || warn "Network preflight reported a problem - trying the build anyway"
-        fi
-        log "docker compose build (the module must be compiled in; cached rebuild: 1-15 minutes)"
-        if ! docker compose build; then
-            warn "Build failed - retrying once (transient mirror/network problems)"
-            sleep 10
-            docker compose build || die "image build failed (see README troubleshooting: apt/DNS/IPv6)"
+        # coa-build.sh brings the network preflight and the ccache snapshot
+        # handling (restore + save) - same build path as coa-oneclick/coa-update.
+        if [ -f "$SCRIPT_DIR/coa-build.sh" ]; then
+            AC_DIR="${AC_DIR:-/opt/azerothcore}" bash "$SCRIPT_DIR/coa-build.sh" \
+                || die "image build failed - see /root/coa-build.log and the README troubleshooting"
+        else
+            warn "coa-build.sh not found next to this script - building without the ccache snapshot"
+            docker compose build \
+                || die "image build failed (see README troubleshooting: apt/DNS/IPv6)"
         fi
         ok "Images rebuilt (tag: $(grep -E '^DOCKER_IMAGE_TAG=' .env | head -1 | cut -d= -f2-))"
-        docker image prune -f >/dev/null 2>&1 || true
-        docker builder prune -f --keep-storage 8GB >/dev/null 2>&1 || true
     fi
     if [ "$WS_CONF_CHANGED" = "1" ]; then
         warn "worldserver.conf was changed (MapUpdate.Threads) - the restart below applies it"

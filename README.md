@@ -24,9 +24,10 @@ fork (Conquest of AzerothCore) on your own Linux server – including a one-comm
 
 ```bash
 # 1) copy the scripts to your server (keep all files in the same folder)
-scp coa-oneclick.sh coa-update.sh apply-missing-updates.sh \
-    check-repo-updates.sh fix-build-network.sh fix-container-dns.sh \
-    fix-config-warnings.py docker-compose.override.yml root@<SERVER-IP>:/root/
+scp coa-oneclick.sh coa-update.sh coa-build.sh coa-check.sh coa-fix-network.sh \
+    apply-missing-updates.sh fix-config-warnings.py docker-compose.override.yml \
+    root@<SERVER-IP>:/root/
+# optional: enable-playerbots.sh, transfer-data.sh, patches/
 
 # 2) deploy (base: standard AzerothCore world, downloaded client data v20.0)
 bash /root/coa-oneclick.sh 2>&1 | tee /root/coa-deploy.log
@@ -160,8 +161,10 @@ What it does:
    hardcoded code default is printed, so a change never goes unnoticed
    (`--keep-code-defaults` keeps the code default instead – see the troubleshooting table for
    the ability/progression switches that this affects).
-5. Frees old images (`docker image prune -f`), restarts the stack (with visible progress and
-   hard time limits) and prints a status report
+5. Builds the docker images through **`coa-build.sh`** (ccache snapshot + build cache GC
+   policy, so a rebuild takes minutes instead of 45-120 – see
+   [Build caching](#build-caching-why-a-rebuild-takes-minutes)), restarts the stack (with
+   visible progress and hard time limits) and prints a status report
 
 If nothing changed, the run finishes in seconds and only re-checks the database.
 
@@ -245,7 +248,7 @@ falls back to the code default.
 | Module | `git clone`/`fetch` of `modules/mod-playerbots` (branch `coa`) |
 | Config | `playerbots.conf` + `MapUpdate.Threads` (the stock default `1` starves hundreds of bots) |
 | Database | `acore_playerbots` + module base data (names, texts, travel nodes) + all missing module updates for `acore_playerbots`, `acore_world` and `acore_characters` |
-| Images | `docker compose build` (the worldserver compiles the module in) |
+| Images | `coa-build.sh` (the worldserver compiles the module in; ccache snapshot included) |
 | Start | stack restart, realm flag, verification (module, image, database, bot accounts) |
 
 `mod-playerbots` normally populates and updates its own database at worldserver startup. The runtime
@@ -258,7 +261,7 @@ core updates are applied:
 ```bash
 bash /root/enable-playerbots.sh --status        # read-only: module, image, database, bots
 bash /root/apply-missing-updates.sh             # missing updates for all four databases
-bash /root/check-repo-updates.sh                # which updates are not registered yet
+bash /root/coa-check.sh updates                 # which updates are not registered yet
 docker exec ac-worldserver tail -30 /azerothcore/env/dist/logs/Playerbots.log
 ```
 
@@ -291,8 +294,11 @@ docker compose logs -f ac-worldserver    # live log
 docker compose restart ac-worldserver    # restart
 docker compose down                      # stop (data stays in volumes)
 
-bash /root/check-repo-updates.sh         # list SQL updates that are not registered yet
-bash /root/apply-missing-updates.sh      # apply them
+bash /root/coa-check.sh all              # containers, databases + real login, updates, DBC rows
+bash /root/coa-check.sh updates          # list SQL updates that are not registered yet
+bash /root/coa-check.sh dbc              # 5 DBC rows the core requires (client data check)
+bash /root/apply-missing-updates.sh      # apply the missing SQL updates
+bash /root/coa-build.sh --stats          # ccache hit rate + snapshot + build cache
 python3 /root/fix-config-warnings.py     # module configs + "Missing property" check (--dry-run: report only)
 docker system df                         # disk usage of images / volumes / cache
 ```
@@ -320,12 +326,12 @@ The database root password lives in `/opt/azerothcore/.env`
   automatically (value `0` equals `SPELL_EFFECT_NONE`). If upstream fixes it, nothing happens.
 * **Your dump is only used partially:** only the `acore_world` section of a full mysqldump is
   imported, so accounts and characters on the target server stay untouched.
-* **After a Docker daemon restart** (`fix-build-network.sh`, `fix-resolv.sh`, a package update) the
+* **After a Docker daemon restart** (`coa-fix-network.sh`, a package update) the
   network sandbox and the DNS alias registration of already running containers can become stale.
   Such a container no longer resolves its peers: the worldserver then restarts in a loop with
   `Could not connect to MySQL database at ac-database: Unknown MySQL server host 'ac-database' (-3)`
   (MySQL error `-3` = `CR_UNKNOWN_HOST`). Nothing is damaged – `docker compose up -d --force-recreate`
-  (or `bash /root/fix-container-dns.sh`) puts every container back on the same network with a fresh
+  (or `bash /root/coa-fix-network.sh --runtime`) puts every container back on the same network with a fresh
   resolver configuration; accounts, characters and the CoA world data stay in the Docker volumes.
   Docker normally gives each container the embedded resolver `127.0.0.11`, which answers the
   compose service names – a custom `"dns"` entry in `/etc/docker/daemon.json` only changes which
@@ -339,10 +345,63 @@ The database root password lives in `/opt/azerothcore/.env`
 * **Backups & logs:** `acore_world_old` (world before the import, drop it when you are happy),
   `/root/updates_backup_acore_*.sql` (overwritten on every run), `/root/coa-deploy.log`,
   `/root/apply-missing-updates.log`.
-* **Disk:** docker's build cache is the largest consumer (it makes rebuilds fast –
-  a cached rebuild takes ~1-2 minutes instead of 15-30). Free it with
-  `docker builder prune -f` if you need space (the next build will be a full build).
-  Container logs are rotated (max. 20 MB x 3 files per service).
+* **Disk:** docker's build cache is the largest consumer – and it is what makes rebuilds fast
+  (`coa-build.sh --stats` shows it, the ccache itself is additionally kept outside of Docker in
+  `/root/.coa-build/ccache.tar`, see [Build caching](#build-caching-why-a-rebuild-takes-minutes)).
+  **Never run `docker builder prune` / `docker buildx prune` to free space** – that deletes the
+  ccache and the next build compiles from zero (45-120 min). Use `docker system df` to look and
+  `--gc-config` in `coa-build.sh` to cap the cache instead. Container logs are rotated
+  (max. 20 MB x 3 files per service).
+
+---
+
+## Build caching (why a rebuild takes minutes)
+
+A cold build of AzerothCore + modules is **2239 compiler calls** – on 4-8 cores that is 45-120
+minutes. Everything that makes a later rebuild short hangs on **ccache**, and ccache lives in a
+BuildKit cache mount (`/ccache`) inside Docker's build cache. That mount had two problems:
+
+1. **Docker's build cache GC deletes cache mounts.** Its policy 1 classifies them as "easily
+   regenerated" (`docs.docker.com/build/cache/garbage-collection`) and removes them together with
+   the cache record that created them. Measured on a running CoA server before this fix:
+
+   ```
+   $ bash coa-build.sh --stats
+   Cacheable calls:    2239 / 2239 (100.0%)
+     Hits:                0 / 2239 ( 0.00%)     <- the mount was empty, everything compiled
+     Misses:           2239 / 2239 (100.0%)
+   Cache size (GiB):  0.5 /  5.0 (10.64%)
+   ```
+
+2. **`/azerothcore/build` is empty at the start of every build** (the upstream Dockerfile compiles
+   into a throw-away directory), so ninja can never continue where the last build stopped – there is
+   no incremental build to fall back on.
+
+`coa-build.sh` therefore keeps the ccache **outside** of Docker:
+
+| Step | What happens |
+|---|---|
+| restore | if the BuildKit mount is empty, `/root/.coa-build/ccache.tar` is unpacked into it |
+| build | `docker compose build` (BuildKit, ccache hits) |
+| save | the mount is packed back into the tar afterwards (`docker build --output type=local`) |
+
+```bash
+bash /root/coa-build.sh                 # restore + build + save (used by coa-update.sh / coa-oneclick.sh)
+bash /root/coa-build.sh --stats         # hit rate, mount, snapshot - read-only
+bash /root/coa-build.sh --gc-config     # keep Docker's GC away from the build cache
+bash /root/coa-build.sh --full          # ignore the layer cache (ccache still applies)
+```
+
+* Expect **a few minutes** for a rebuild after `git pull` (only the changed translation units plus
+  the link step). A 45-120 minute build only happens when the ccache is really cold, or after a
+  change in a widely included core header – that is C++, not a caching bug.
+* The snapshot is a normal host file: `rm /root/.coa-build/ccache.tar` is safe (the next build
+  recreates it). `docker builder prune` / `docker buildx prune` in contrast **delete the ccache** –
+  do not use them to free space.
+* `--gc-config` writes a `builder.gc` policy into `/etc/docker/daemon.json` (backup kept, checked
+  with `dockerd --validate`) so that cache mounts are kept for 14 days and the build cache is capped
+  instead of growing forever. It takes effect after `systemctl restart docker`;
+  `coa-oneclick.sh` applies it during setup while no container is running yet.
 
 ---
 
@@ -354,18 +413,19 @@ The database root password lives in `/opt/azerothcore/.env`
 | Build fails: `no matching member function for call to 'NearTeleportTo'` | upstream bug in mod-ascension-compat – the scripts patch it automatically, just re-run `bash coa-oneclick.sh` |
 | `Import failed (only 0 items in item_template)` | the base databases did not exist yet – run `cd /opt/azerothcore && docker compose up ac-db-import` once, then import the CoA dump again |
 | Build fails: `use of undeclared identifier 'SPELL_EFFECT_NONE'` | run `bash coa-oneclick.sh` again – it patches the line automatically |
-| Build fails: `E: Unable to locate package tzdata`, `Some index files failed to download` after ~240 s | the build container cannot reach the apt mirrors (broken IPv6 or a DNS stub) – run `bash fix-build-network.sh` (the deploy scripts call it automatically). Manual fix: pin Docker DNS (`/etc/docker/daemon.json` with `"dns": ["1.1.1.1","8.8.8.8"]`) and, if the host has no working IPv6, disable it (`net.ipv6.conf.all.disable_ipv6 = 1`) |
+| Build fails: `E: Unable to locate package tzdata`, `Some index files failed to download` after ~240 s | the build container cannot reach the apt mirrors (broken IPv6 or a DNS stub) – run `bash coa-fix-network.sh --build` (the deploy scripts call it automatically). Manual fix: pin Docker DNS (`/etc/docker/daemon.json` with `"dns": ["1.1.1.1","8.8.8.8"]`) and, if the host has no working IPv6, disable it (`net.ipv6.conf.all.disable_ipv6 = 1`) |
+| Every rebuild compiles from zero / takes 45-120 min | the ccache was empty: `bash coa-build.sh --stats` shows `Hits: 0 ... Misses: 2239` (Docker's build cache GC removed the cache mount, see [Build caching](#build-caching-why-a-rebuild-takes-minutes)). Fix: `bash coa-build.sh` (restores `/root/.coa-build/ccache.tar` into the mount before building) plus `bash coa-build.sh --gc-config` + `systemctl restart docker` to keep Docker's GC away from it. Never `docker builder prune` |
 | `docker compose up` fails on `ac-db-import ... exit 1` | the AC auto-updater tried to write into CoA data – `docker-compose.override.yml` must be present (the script creates it) |
 | Client log: "malformed packet" | the client sends plaintext world headers – apply `AscensionCompat.AllowRemoteClients = 1` (script) **and** patch `Extensions.dll` |
 | Client cannot enter the realm / crashes | apply `patch_world_endpoint.py` (from the CoA fork repository) to `Extensions.dll` |
 | `unrar: Unsupported Method` | the archive is RAR5 / WinRAR 7 – the script installs RARLAB's `unrar`; alternatively provide a `.zip` |
 | Port 3306 already in use | `DB_EXTERNAL_PORT=127.0.0.1:13306` (the default) – only needed if a host MySQL/MariaDB runs |
 | `coa-update.sh` looks frozen after `Starting worldserver ...` | `docker compose up` is waiting for a dependency (`ac-database` healthy, `ac-db-import` / `ac-client-data-init` completed) or the worldserver is in a crash loop. Current scripts report progress every 15 s, stop after 5 / 7 minutes and print the `ac-*` container states plus the last 30 log lines. Older copies polled the port for 4 minutes without any output. Manual check: `cd /opt/azerothcore && docker compose ps -a`, `docker logs --tail 50 ac-worldserver`, `docker logs --tail 20 ac-client-data-init`, `df -h /` |
-| Worldserver restart loop, log: `Could not connect to MySQL database at ac-database: Unknown MySQL server host 'ac-database' (-3)` + `DatabasePool Login NOT opened` | MySQL error `-3` is `CR_UNKNOWN_HOST`, so the container cannot resolve the compose service name – **no database or image damage**. Check the database side with `bash /root/check-db-access.sh` (read-only: databases, MySQL users, a real login over the compose network) and repair the container side with `bash /root/fix-container-dns.sh`: it prints the facts (resolv.conf, networks, DNS aliases, `daemon.json`), probes the name with a throwaway container in the same network and then applies the smallest fix – restart the application containers, or recreate the stack so all containers share one network with a fresh resolver configuration and re-registered DNS aliases. Only if that is not enough does it remove a custom `"dns"` entry from `/etc/docker/daemon.json` (backup kept) and restart the Docker daemon. Data stays in the volumes. |
+| Worldserver restart loop, log: `Could not connect to MySQL database at ac-database: Unknown MySQL server host 'ac-database' (-3)` + `DatabasePool Login NOT opened` | MySQL error `-3` is `CR_UNKNOWN_HOST`, so the container cannot resolve the compose service name – **no database or image damage**. Check the database side with `bash /root/coa-check.sh db` (read-only: databases, MySQL users, a real login over the compose network) and repair the container side with `bash /root/coa-fix-network.sh --runtime`: it prints the facts (resolv.conf, networks, DNS aliases, `daemon.json`), probes the name with a throwaway container in the same network and then applies the smallest fix – restart the application containers, or recreate the stack so all containers share one network with a fresh resolver configuration and re-registered DNS aliases. Only if that is not enough does it remove a custom `"dns"` entry from `/etc/docker/daemon.json` (backup kept) and restart the Docker daemon. Data stays in the volumes. |
 | Vanity items: "has no AzerothCore item template yet" | CoA world data missing → import the CoA dump (`COA_WORLD_DUMP`) |
 | Worldserver log is flooded with `> Config: Missing property <KEY> in config file ... or module config` and `Config::LoadFile: Duplicate key name '<KEY>'` | The core loads `env/dist/etc/modules/<name>.conf` **only** – a module config that was never copied from its `.conf.dist` is not loaded at all, so every config key that module reads logs one warning per read (this server: 92 839 lines in one day from `mod-coa-challenges` and `mod-dynamic-xp`, because older `coa-oneclick.sh` copies activated three hard-coded modules). Neither message is an error – the hardcoded code default was used – but they bury real errors. Fix: `python3 /root/fix-config-warnings.py` – it fetches the module config templates from the image, activates every missing module config, defines the keys the log reported as missing (with the value that was in effect – the warning disappears and nothing else changes), keeps the value that was in effect for keys whose `.dist` default differs, removes the duplicate keys from `worldserver.conf` (the first definition is the one that counts), restarts the worldserver and verifies both message types are gone. Use `--dry-run` to see the report without writing anything. `coa-oneclick.sh` and `coa-update.sh` call it automatically with `--no-restart` before they start the stack (skip with `SKIP_CONFIG_FIX=1`), so a core update that adds a new module can no longer bring the flood back. |
 
-| Characters no longer learn their class abilities automatically (no new spells/ranks/talents on level up) | **Intended by the fork, not by this deployment:** `mod-spellbook` restores the **Books of Ascension** as class trainers and ships `AscensionCompat.AutoProgression = 0` (config file **and** code default) in `mod-ascension-compat` – abilities are bought from the books instead of being granted on level up (`AscensionCompat.cpp`: "Switched off, nothing is granted here and the player earns them another way"). The books only work once the two **pending world updates** are applied – `bash apply-missing-updates.sh` inserts them: `rev_20260918_21_spellbook_trainer.sql` moves the book templates to the `npc_spellbook_trainer` script plus the trainer flag (`0x30`), `rev_20260918_20_books_of_ascension.sql` restores the missing book creatures and the Ethereal Bazaar vendor. Without them the old `npc_ascension_training_book` gossip stays on the templates and – because `AutoProgression = 0` – grants nothing at all. Check: `docker exec -i ac-database mysql -uroot -p"$PW" acore_world -N -B -e "SELECT COUNT(*) FROM creature_template WHERE ScriptName='npc_spellbook_trainer'"` (must be > 0) and `bash check-repo-updates.sh` (lists the two updates while they are missing). If you want the old automatic grants back instead: `AscensionCompat.AutoProgression = 1` in `env/dist/etc/modules/mod_ascension_compat.conf` + `docker compose restart ac-worldserver`. |
+| Characters no longer learn their class abilities automatically (no new spells/ranks/talents on level up) | **Intended by the fork, not by this deployment:** `mod-spellbook` restores the **Books of Ascension** as class trainers and ships `AscensionCompat.AutoProgression = 0` (config file **and** code default) in `mod-ascension-compat` – abilities are bought from the books instead of being granted on level up (`AscensionCompat.cpp`: "Switched off, nothing is granted here and the player earns them another way"). The books only work once the two **pending world updates** are applied – `bash apply-missing-updates.sh` inserts them: `rev_20260918_21_spellbook_trainer.sql` moves the book templates to the `npc_spellbook_trainer` script plus the trainer flag (`0x30`), `rev_20260918_20_books_of_ascension.sql` restores the missing book creatures and the Ethereal Bazaar vendor. Without them the old `npc_ascension_training_book` gossip stays on the templates and – because `AutoProgression = 0` – grants nothing at all. Check: `docker exec -i ac-database mysql -uroot -p"$PW" acore_world -N -B -e "SELECT COUNT(*) FROM creature_template WHERE ScriptName='npc_spellbook_trainer'"` (must be > 0) and `bash coa-check.sh updates` (lists the two updates while they are missing). If you want the old automatic grants back instead: `AscensionCompat.AutoProgression = 1` in `env/dist/etc/modules/mod_ascension_compat.conf` + `docker compose restart ac-worldserver`. |
 | Bots are missing in the game (no `.playerbots` command) | `bash /root/enable-playerbots.sh --status` shows the three parts: the module, the image and the database. Missing image → `cd /opt/azerothcore && docker compose build`; missing database → `bash /root/enable-playerbots.sh --db`; module not installed → `bash /root/enable-playerbots.sh` |
 | Worldserver restart loop, log: `DatabasePool Playerbots NOT opened` | the module is compiled into the image, but `acore_playerbots` does not exist (hand-made `docker compose build` before `enable-playerbots.sh`) → `bash /root/enable-playerbots.sh --db` |
 | Log: `> AUTOUPDATER: Automatic database updates are disabled for all databases in the config!` (logger `server.playerbots`) | expected in this deployment: the bot database is maintained from the host (see [Player bots](#player-bots-optional)), the module's own updater has no sources in the runtime image |
@@ -404,7 +464,7 @@ ownership to uid 1000 and writes the `data-version` marker so the
 Afterwards verify the DBC guard and import the world database:
 
 ```bash
-python3 check-dbc-rows.py /var/lib/docker/volumes/azerothcore_ac-client-data/_data/dbc
+bash coa-check.sh dbc /var/lib/docker/volumes/azerothcore_ac-client-data/_data/dbc
 # -> 5/5 required rows present
 FORCE_IMPORT=1 COA_WORLD_DUMP=/root/databases.sql.gz bash coa-oneclick.sh
 ```
@@ -427,14 +487,12 @@ cd /opt/azerothcore && docker compose up ac-db-import
 | `coa-update.sh` | update: repo + core fixes + SQL updates + rebuild + restart (keeps the bot module in sync) |
 | `enable-playerbots.sh` | optional player bots: module + config + `acore_playerbots` + rebuild (`--prepare` / `--config` / `--db` / `--status`) |
 | `apply-missing-updates.sh` | applies repo SQL updates to auth/characters/world – and to playerbots when the module is installed (SHA1 + state exactly like AC) |
-| `check-repo-updates.sh` | read-only check: which repo updates are not registered yet (all four databases) |
-| `docker-compose.override.yml` | disables the auto-updater for CoA world data + log rotation |
-| `fix-build-network.sh` | repairs container DNS/IPv6 so image builds can reach the apt mirrors |
-| `fix-container-dns.sh` | repairs container DNS/network when the worldserver cannot resolve `ac-database` (error -3) |
-| `check-db-access.sh` | read-only check: databases, MySQL users and a real login over the compose network |
+| `coa-build.sh` | **the only place that builds the images**: network preflight, BuildKit build, ccache snapshot (restore + save), build cache GC policy; also `--stats`, `--gc-config`, `--restore` / `--save`, `--full` |
+| `coa-check.sh` | read-only checks: `db` (databases, MySQL users + a real login over the compose network), `updates` (which repo SQL is not registered yet), `dbc` (the 5 client DBC rows the core requires), `containers`, `all` |
+| `coa-fix-network.sh` | `--build` repairs container DNS/IPv6 so image builds reach the apt mirrors; `--runtime` repairs a running stack that cannot resolve `ac-database` (MySQL error -3); no argument = both |
+| `docker-compose.override.yml` | disables the auto-updater for CoA world data + log rotation + the ccache build args |
 | `patches/db-<db>/*.sql` | project patches for tables the core/module code needs but upstream never shipped as SQL |
 | `transfer-data.sh` | copies the CoA world dump + client data from another server |
-| `check-dbc-rows.py` | verifies the CoA client DBC set the core requires (5 rows) |
 | `fix-config-warnings.py` | fetches the module config templates from the image, activates every module config, defines the keys the log reported as missing, removes duplicate keys, verifies the worldserver log is free of config warnings (runs automatically in `coa-oneclick.sh` / `coa-update.sh`) |
 | `README.md` | this guide |
 

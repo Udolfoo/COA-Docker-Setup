@@ -135,6 +135,24 @@ fi
 systemctl enable --now docker >/dev/null 2>&1
 ok "Docker service: $(systemctl is-active docker)"
 
+# Docker's build cache garbage collection deletes BuildKit cache mounts (its
+# policy 1 counts them as "easily regenerated") and shrinks the cache to a small
+# default budget. That is what emptied the ccache and turned every rebuild into a
+# full 45-120 minute compile (measured: "Hits: 0 / 2239 (0.00%)"). Raise the
+# budget here, while the stack is usually not running yet - coa-build.sh keeps a
+# second, GC-independent copy of the ccache (see /root/.coa-build/ccache.tar).
+if [ -f "$SELF_DIR/coa-build.sh" ]; then
+    bash "$SELF_DIR/coa-build.sh" --gc-config >/dev/null 2>&1 \
+        && ok "Build cache GC configured (cache mounts are kept for 14 days)" \
+        || warn "build cache GC could not be configured - see: bash $SELF_DIR/coa-build.sh --gc-config"
+    if [ "$(docker ps -q 2>/dev/null | wc -l)" -eq 0 ]; then
+        systemctl restart docker >/dev/null 2>&1 && sleep 3 \
+            && ok "Docker restarted - the build cache GC policy is active"
+    else
+        warn "GC policy takes effect after the next Docker restart (systemctl restart docker)"
+    fi
+fi
+
 if [ "$SKIP_SWAP" = "1" ]; then
     warn "Swap skipped (SKIP_SWAP=1)"
 elif [ -n "$(swapon --show 2>/dev/null)" ]; then
@@ -347,24 +365,18 @@ if [ "$WITH_PLAYERBOTS" = "1" ]; then
     NEED_BUILD=1
 fi
 if [ "$NEED_BUILD" = "1" ]; then
-    # Network preflight: on a fresh VPS the build often fails because a container
-    # cannot reach the apt mirrors (broken IPv6 or a DNS stub). Takes up to ~2 min.
-    if [ -f "$SELF_DIR/fix-build-network.sh" ]; then
-        log "Network preflight: checking container DNS/IPv6 (hard limit 5 minutes) ..."
-        timeout 300 bash "$SELF_DIR/fix-build-network.sh" \
-            || warn "Network preflight reported a problem - trying the build anyway"
-    fi
-    log "docker compose build (30-120 minutes)"
-    if ! docker compose build; then
-        warn "Build failed - retrying once (transient mirror/network problems)"
-        sleep 10
+    # coa-build.sh does the whole image build: network preflight, BuildKit build,
+    # and the ccache handling (restore the snapshot into the BuildKit mount when
+    # Docker's GC emptied it, save it again afterwards). Details: coa-build.sh.
+    if [ -f "$SELF_DIR/coa-build.sh" ]; then
+        AC_DIR="$AC_DIR" bash "$SELF_DIR/coa-build.sh" \
+            || die "Image build failed (see /root/coa-build.log + README troubleshooting)"
+    else
+        warn "coa-build.sh not found next to this script - building without the ccache snapshot"
         docker compose build \
             || die "Image build failed (see README troubleshooting: apt/DNS/IPv6)"
     fi
-    ok "Images built (tag: ${IMAGE_TAG})"
-    docker image prune -f >/dev/null 2>&1 || true
-    docker builder prune -f --keep-storage 8GB >/dev/null 2>&1 || true
-    ok "Old images and build cache cleaned up (check: docker system df)"
+    ok "Images ready (tag: ${IMAGE_TAG})"
 else
     ok "Images present (FORCE_BUILD=1 forces a rebuild)"
 fi

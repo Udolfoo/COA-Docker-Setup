@@ -77,5 +77,5 @@ echo "=== 4) summary ==="
 du -sh "$VOLUME"/* 2>/dev/null
 echo
 echo "next: verify the DBC guard rows, then import the CoA world"
-echo "  python3 /root/check-dbc-rows.py $VOLUME/dbc"
+echo "  bash /root/coa-check.sh dbc          # 5 required DBC rows"
 echo "  FORCE_IMPORT=1 COA_WORLD_DUMP=/root/databases.sql.gz bash coa-oneclick.sh"

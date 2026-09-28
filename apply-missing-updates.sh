@@ -105,7 +105,7 @@ ws_dns_diag() {   # prints facts only when the database container cannot be reso
     done
     [ -f /etc/docker/daemon.json ] && \
         printf "  daemon.json    : %s\n" "$(tr -d '\n' < /etc/docker/daemon.json)"
-    echo "  repair: bash /root/fix-container-dns.sh   (recreates the containers with clean DNS)"
+    echo "  repair: bash /root/coa-fix-network.sh --runtime   (recreates the containers with clean DNS)"
 }
 ws_diag() {
     echo "  --- diagnostics ---"

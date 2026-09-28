@@ -94,7 +94,7 @@ ws_dns_diag() {   # prints facts only when the database container cannot be reso
     done
     [ -f /etc/docker/daemon.json ] && \
         printf "      daemon.json    : %s\n" "$(tr -d '\n' < /etc/docker/daemon.json)"
-    echo "      repair: bash /root/fix-container-dns.sh   (recreates the containers with clean DNS)"
+    echo "      repair: bash /root/coa-fix-network.sh --runtime   (recreates the containers with clean DNS)"
 }
 ws_diag() {
     echo "      --- diagnostics ---"
@@ -254,25 +254,19 @@ fi
 
 step "3/5  Docker images"
 if [ "$CODE_CHANGED" = "1" ] || [ "$FULL" = "1" ]; then
-    # Network preflight: a fresh VPS can fail here because a build container
-    # cannot reach the apt mirrors (broken IPv6 or a DNS stub). Max ~2 minutes.
-    if [ -f "$SCRIPT_DIR/fix-build-network.sh" ]; then
-        log "Network preflight: checking container DNS/IPv6 (hard limit 5 minutes) ..."
-        timeout 300 bash "$SCRIPT_DIR/fix-build-network.sh" \
-            || warn "Network preflight reported a problem - trying the build anyway"
-    fi
-    log "Building images (30-120 minutes) ..."
-    if ! docker compose build; then
-        warn "Build failed - retrying once (transient mirror/network problems)"
-        sleep 10
+    # coa-build.sh: network preflight + BuildKit build + the ccache handling
+    # (a snapshot is unpacked into the BuildKit cache mount when Docker's build
+    # cache GC emptied it, and packed again afterwards - that is what keeps a
+    # rebuild at a few minutes instead of 45-120).
+    if [ -f "$SCRIPT_DIR/coa-build.sh" ]; then
+        AC_DIR="$AC_DIR" bash "$SCRIPT_DIR/coa-build.sh" \
+            || die "Image build failed - see /root/coa-build.log and the README troubleshooting"
+    else
+        warn "coa-build.sh not found next to this script - building without the ccache snapshot"
         docker compose build \
             || die "Image build failed (see README troubleshooting: apt/DNS/IPv6)"
     fi
     ok "Images rebuilt"
-    # Free old images + cap the build cache (prevents the disk filling up over time)
-    docker image prune -f >/dev/null 2>&1 || true
-    docker builder prune -f --keep-storage 8GB >/dev/null 2>&1 || true
-    ok "Old images and build cache cleaned up (check: docker system df)"
 else
     ok "No code change -> images unchanged (FULL=1 forces a rebuild)"
 fi
