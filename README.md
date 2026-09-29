@@ -292,7 +292,10 @@ cd /opt/azerothcore
 docker compose ps                        # status
 docker compose logs -f ac-worldserver    # live log
 docker compose restart ac-worldserver    # restart
-docker compose down                      # stop (data stays in volumes)
+docker compose stop                      # stop everything (the worldserver saves first)
+docker compose stop ac-worldserver       # only the game server (database keeps running)
+docker compose up -d                     # start the stack again
+docker compose down                      # stop *and* remove the containers (volumes stay)
 
 bash /root/coa-check.sh all              # containers, databases + real login, updates, DBC rows
 bash /root/coa-check.sh updates          # list SQL updates that are not registered yet
@@ -306,6 +309,25 @@ docker system df                         # disk usage of images / volumes / cach
 The database root password lives in `/opt/azerothcore/.env`
 (`DOCKER_DB_ROOT_PASSWORD`); on the first run it is also stored in
 `/root/coa-db-password.txt`.
+
+**Stopping / starting – the details that matter:**
+
+* `docker compose stop` sends SIGTERM: the worldserver saves characters and world data and shuts
+  down cleanly (a few seconds). **Never `docker compose kill` / `docker kill`** – that is a hard kill
+  and can lose everything since the last save.
+* `docker compose down` also removes the containers; the data stays, because the database and the
+  client data live in named volumes (`DOCKER_VOL_DB`, `DOCKER_VOL_DATA` in `.env`).
+  **Never `docker compose down -v`** – `-v` deletes those volumes (all characters, the world, the
+  ~30 GB client data).
+* Clients see *Realm Offline* while `ac-worldserver` is stopped.
+* `systemctl stop docker` stops every container of the machine (also other projects). Containers that
+  were running come back automatically after `systemctl start docker` (`restart: unless-stopped`);
+  containers you stopped with `docker compose stop` stay stopped.
+* After a manual stop + start the client can still show *Realm Offline*: the core sets the offline
+  flag when the worldserver stops and a version-mismatch bit on startup. Clear both with
+  `PW=$(grep '^DOCKER_DB_ROOT_PASSWORD=' /opt/azerothcore/.env | cut -d= -f2-)` followed by
+  `docker exec -i ac-database mysql -uroot -p"$PW" acore_auth -e "UPDATE realmlist SET flag = flag & ~3 WHERE id=1"`
+  – the deployment scripts do this after every start themselves.
 
 ---
 
