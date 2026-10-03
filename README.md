@@ -25,7 +25,7 @@ fork (Conquest of AzerothCore) on your own Linux server – including a one-comm
 ```bash
 # 1) copy the scripts to your server (keep all files in the same folder)
 scp coa-oneclick.sh coa-update.sh coa-build.sh coa-check.sh coa-fix-network.sh \
-    apply-missing-updates.sh fix-config-warnings.py docker-compose.override.yml \
+    apply-missing-updates.sh fix-config-warnings.py fix-quest-menu-overflow.py docker-compose.override.yml \
     root@<SERVER-IP>:/root/
 # optional: enable-playerbots.sh, transfer-data.sh, patches/
 
@@ -346,6 +346,12 @@ The database root password lives in `/opt/azerothcore/.env`
 * **Build fix:** the fork removed `SPELL_EFFECT_NONE` from `enum SpellEffects` while
   `mod-ascension-compat` still uses the name – the build fails. Both scripts patch that line
   automatically (value `0` equals `SPELL_EFFECT_NONE`). If upstream fixes it, nothing happens.
+* **Call Board / quest-menu crash:** the CoA Call Boards (game objects 402000/402001) carry 43
+  quests each, but the core quest menu only supports `GOSSIP_MAX_MENU_ITEMS` (32) entries –
+  `QuestMenu::AddMenuItem()` aborted the whole worldserver (`ASSERTION FAILED`, `GossipDef.cpp`)
+  as soon as a playerbot read one. `coa-update.sh` re-applies the cap after every checkout via
+  `fix-quest-menu-overflow.py` (idempotent: it only patches the original pattern, so it does
+  nothing once upstream fixes the menu itself).
 * **Your dump is only used partially:** only the `acore_world` section of a full mysqldump is
   imported, so accounts and characters on the target server stay untouched.
 * **After a Docker daemon restart** (`coa-fix-network.sh`, a package update) the
@@ -516,6 +522,7 @@ cd /opt/azerothcore && docker compose up ac-db-import
 | `patches/db-<db>/*.sql` | project patches for tables the core/module code needs but upstream never shipped as SQL |
 | `transfer-data.sh` | copies the CoA world dump + client data from another server |
 | `fix-config-warnings.py` | fetches the module config templates from the image, activates every module config, defines the keys the log reported as missing, removes duplicate keys, verifies the worldserver log is free of config warnings (runs automatically in `coa-oneclick.sh` / `coa-update.sh`) |
+| `fix-quest-menu-overflow.py` | caps the quest menu at `GOSSIP_MAX_MENU_ITEMS` – the Call Boards (43 quests) used to abort the worldserver; run automatically by `coa-update.sh` as build fix 3 |
 | `README.md` | this guide |
 
 ---

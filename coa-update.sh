@@ -183,7 +183,16 @@ else
     # (the fix is re-applied automatically further down).
     FIXREL="modules/mod-ascension-compat/src/AscensionCompat.cpp"
     FIXREL2="modules/mod-ascension-compat/src/AscensionChronomancerMovement.cpp"
-    git checkout -- "$FIXREL" "$FIXREL2" 2>/dev/null || true
+    # The quest-menu crash fix (build fix 3) lives in these two core files.
+    FIXREL3="src/server/game/Entities/Player/PlayerQuest.cpp"
+    FIXREL4="src/server/game/Entities/Creature/GossipDef.cpp"
+    # One checkout per path: a single unknown pathspec (e.g. the
+    # mod-ascension-compat files when the module is not installed) makes a
+    # combined "git checkout --" fail for ALL paths - the reset then
+    # silently does nothing and the update dies on the next checkout.
+    for fix_file in "$FIXREL" "$FIXREL2" "$FIXREL3" "$FIXREL4"; do
+        git checkout -- "$fix_file" 2>/dev/null || true
+    done
     if git checkout -B "$REPO_BRANCH" FETCH_HEAD >/dev/null 2>&1; then
         AFTER="$(git rev-parse HEAD)"
         ok "Repo updated: ${BEFORE:0:9} -> ${AFTER:0:9}"
@@ -226,6 +235,21 @@ PYEOF
     ok "Build fix 2 re-applied (NearTeleportTo temporary -> named Position)"
 else
     ok "Build fix 2 not required (NearTeleportTo)"
+fi
+
+# 3) Worldserver crash: the CoA Call Boards (game objects 402000/402001) carry 43 quests each,
+#    but the core quest menu only supports GOSSIP_MAX_MENU_ITEMS (32) entries. As soon as a
+#    playerbot read a board, QuestMenu::AddMenuItem() aborted the whole worldserver (restart
+#    loop every few minutes). The menu is now capped and logs the source entry once, so the
+#    boards keep working without a crash. See the crash signature in the log:
+#      ASSERTION FAILED / GossipDef.cpp:292 AddMenuItem / _questMenuItems.size() <= 32
+QFFIX="$SCRIPT_DIR/fix-quest-menu-overflow.py"
+if [ -f "$QFFIX" ] && grep -q 'ASSERT(_questMenuItems.size() <= GOSSIP_MAX_MENU_ITEMS);' "$AC_DIR/src/server/game/Entities/Creature/GossipDef.cpp" 2>/dev/null; then
+    python3 "$QFFIX" "$AC_DIR" || die "Build fix failed: $QFFIX"
+    CODE_CHANGED=1
+    ok "Build fix 3 re-applied (quest menu capped at GOSSIP_MAX_MENU_ITEMS)"
+else
+    ok "Build fix 3 not required (quest menu cap)"
 fi
 
 # --- Optional module: mod-playerbots (installed by enable-playerbots.sh) -----
