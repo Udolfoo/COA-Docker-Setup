@@ -358,6 +358,9 @@ The database root password lives in `/opt/azerothcore/.env`
   instead and aborted the whole worldserver (`std::out_of_range` / `unordered_map::at` /
   `Caught signal 6`) as soon as a bot carrying such a copy evaluated its equipment: a restart loop
   about a minute after every start. `coa-update.sh` keeps that lookup fixed (build fix 4).
+  Local modifications in the module (this fix included) are saved to
+  `/root/playerbots-local-changes-*.patch` and dropped before a module update, so they can never
+  block it - build fix 4 re-applies what the module still needs.
 * **Your dump is only used partially:** only the `acore_world` section of a full mysqldump is
   imported, so accounts and characters on the target server stay untouched.
 * **After a Docker daemon restart** (`coa-fix-network.sh`, a package update) the

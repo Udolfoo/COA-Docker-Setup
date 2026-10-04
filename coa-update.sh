@@ -264,6 +264,29 @@ if [ -d "modules/mod-playerbots/.git" ]; then
     PM_REF="${PLAYERBOTS_REF:-$(grep -E '^PLAYERBOTS_REF=' .env 2>/dev/null | head -1 | cut -d= -f2-)}"
     PM_BEFORE="$(git -C modules/mod-playerbots rev-parse HEAD 2>/dev/null)"
     if git -C modules/mod-playerbots fetch --prune origin "$PM_BRANCH" >/dev/null 2>&1; then
+        # A new revision plus local modifications (this deployment's own build fixes live in
+        # the module too) make the checkout below fail with "Your local changes would be
+        # overwritten" - the module then silently stays on the old revision and the
+        # "unchanged" message hides it. Save the modifications to a patch and drop them
+        # beforehand; build fix 4 re-applies whatever the module still needs.
+        PM_TARGET="${PM_REF:-FETCH_HEAD}"
+        PM_REMOTE="$(git -C modules/mod-playerbots rev-parse --verify --quiet "$PM_TARGET" 2>/dev/null)"
+        PM_DIRTY=0
+        git -C modules/mod-playerbots diff --quiet 2>/dev/null || PM_DIRTY=1
+        if [ -n "$PM_REMOTE" ] && [ "$PM_REMOTE" != "$PM_BEFORE" ] && [ "$PM_DIRTY" = "1" ]; then
+            PMPATCH="/root/playerbots-local-changes-$(date +%Y%m%d-%H%M%S).patch"
+            if git -C modules/mod-playerbots diff > "$PMPATCH" 2>/dev/null; then
+                log "playerbots: local modifications saved to $PMPATCH (build fix 4 re-applies)"
+            else
+                warn "playerbots: local modifications could not be saved to $PMPATCH"
+            fi
+            git -C modules/mod-playerbots status --porcelain --untracked-files=no | sed 's/^/      reset: /'
+            git -C modules/mod-playerbots checkout -- . 2>/dev/null || true
+            if ! git -C modules/mod-playerbots diff --quiet 2>/dev/null; then
+                warn "playerbots: local modifications are still in place (the checkout below may fail):"
+                git -C modules/mod-playerbots status --porcelain --untracked-files=no | head -5 | sed 's/^/      /'
+            fi
+        fi
         if [ -n "$PM_REF" ]; then
             git -C modules/mod-playerbots checkout -q "$PM_REF" >/dev/null 2>&1 \
                 || warn "module: cannot check out PLAYERBOTS_REF=$PM_REF"
