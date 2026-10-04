@@ -294,6 +294,32 @@ else
     log "Playerbots module not installed (optional) - see enable-playerbots.sh"
 fi
 
+# 4) Worldserver crash loop: the CoA level scaling creates level-lifted item copies with dynamic
+#    template ids (e.g. 4401261) that are NOT part of the item store - only the resolver in
+#    ObjectMgr::GetItemTemplate() knows them. The playerbots module read the raw store instead
+#    and aborted the whole worldserver ("terminate called after throwing an instance of
+#    'std::out_of_range' / unordered_map::at") as soon as a bot carrying such a copy evaluated
+#    its equipment: a restart loop about a minute after every start.
+MBFIX="modules/mod-playerbots/src/Mgr/Item/StatsWeightCalculator.cpp"
+if [ -f "$MBFIX" ] && grep -q 'GetItemTemplateStore()->at(itemId)' "$MBFIX"; then
+    python3 - "$MBFIX" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); t = p.read_text()
+old = "    ItemTemplate const* proto = &sObjectMgr->GetItemTemplateStore()->at(itemId);\n"
+new = ("    // Scaled item copies (CoA level scaling) are not part of the item store; only the\n"
+       "    // resolver in ObjectMgr::GetItemTemplate knows them. The raw store lookup aborted\n"
+       "    // the worldserver with std::out_of_range as soon as a bot carried such a copy.\n"
+       "    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);\n")
+assert t.count(old) == 1, "expected exactly one original pattern"
+p.write_text(t.replace(old, new))
+PYEOF
+    grep -q 'GetItemTemplate(itemId)' "$MBFIX" || die "Build fix failed: $MBFIX"
+    CODE_CHANGED=1
+    ok "Build fix 4 re-applied (playerbots: scaled items resolve via ObjectMgr::GetItemTemplate)"
+else
+    ok "Build fix 4 not required (playerbots scaled items)"
+fi
+
 step "2/5  Database updates (core/module fixes)"
 if [ "$SKIP_DB" = "1" ]; then
     warn "skipped (SKIP_DB=1)"

@@ -352,6 +352,12 @@ The database root password lives in `/opt/azerothcore/.env`
   as soon as a playerbot read one. `coa-update.sh` re-applies the cap after every checkout via
   `fix-quest-menu-overflow.py` (idempotent: it only patches the original pattern, so it does
   nothing once upstream fixes the menu itself).
+* **Scaled items crashed the playerbots:** the CoA level scaling hands out level-lifted copies of
+  items (dynamic template ids like `4401261`) that are not part of the item store - only the core
+  resolver `ObjectMgr::GetItemTemplate()` knows them. The playerbots module read the raw store
+  instead and aborted the whole worldserver (`std::out_of_range` / `unordered_map::at` /
+  `Caught signal 6`) as soon as a bot carrying such a copy evaluated its equipment: a restart loop
+  about a minute after every start. `coa-update.sh` keeps that lookup fixed (build fix 4).
 * **Your dump is only used partially:** only the `acore_world` section of a full mysqldump is
   imported, so accounts and characters on the target server stay untouched.
 * **After a Docker daemon restart** (`coa-fix-network.sh`, a package update) the
