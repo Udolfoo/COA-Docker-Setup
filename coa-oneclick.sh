@@ -301,6 +301,14 @@ DOCKER_ROOT="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)"
 [ -n "$DOCKER_ROOT" ] || DOCKER_ROOT="/var/lib/docker"
 VOL_DIR="$DOCKER_ROOT/volumes/${DATA_VOL}/_data"
 log "Docker data root: $DOCKER_ROOT"
+# A fresh server has no ac-client-data volume yet ("docker compose up" only
+# creates it later). Without this, the mv below ran into a missing directory,
+# the errors were swallowed and the script printed a bogus success - and the
+# init container then auto-downloaded the standard v20.0 data the CoA core
+# rejects ("DataDir does not hold the CoA client DBC set").
+docker volume inspect "$DATA_VOL" >/dev/null 2>&1 || docker volume create "$DATA_VOL" >/dev/null
+mkdir -p "$VOL_DIR"
+[ -d "$VOL_DIR" ] || die "cannot create client-data volume dir: $VOL_DIR"
 
 extract_client_archive() {  # <archive> <target dir>
     local src="$1" dst="$2"
@@ -345,11 +353,17 @@ elif [ -n "$CLIENT_DATA" ]; then
     log "Replacing old client data in the volume ..."
     rm -rf "$VOL_DIR/Cameras" "$VOL_DIR/dbc" "$VOL_DIR/maps" "$VOL_DIR/vmaps" "$VOL_DIR/mmaps"
     for d in Cameras dbc maps vmaps mmaps; do
-        [ -d "$SRCROOT/$d" ] && mv "$SRCROOT/$d" "$VOL_DIR/"
+        if [ -d "$SRCROOT/$d" ]; then
+            mv "$SRCROOT/$d" "$VOL_DIR/" || die "moving $d into $VOL_DIR failed"
+        fi
     done
     chown -R 1000:1000 "$VOL_DIR"
     echo "INSTALLED_VERSION=v20.0" > "$VOL_DIR/data-version"   # prevents a re-download
     rm -rf "$TMPD"
+    # The CoA core refuses to start with a partial data set ("DataDir does not
+    # hold the CoA client DBC set") - never report success without checking.
+    [ -d "$VOL_DIR/dbc" ] && [ -d "$VOL_DIR/maps" ] && [ -d "$VOL_DIR/vmaps" ] && [ -d "$VOL_DIR/mmaps" ] \
+        || die "client data installation failed - $VOL_DIR is incomplete (check 'df -h /' and the mv output above)"
     ok "Client data installed: $(du -sh "$VOL_DIR" | cut -f1)"
 else
     warn "No custom client data - ac-client-data-init will download v20.0 automatically"
