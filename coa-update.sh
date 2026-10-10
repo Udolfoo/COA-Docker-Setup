@@ -347,6 +347,17 @@ step "2/5  Database updates (core/module fixes)"
 if [ "$SKIP_DB" = "1" ]; then
     warn "skipped (SKIP_DB=1)"
 elif [ -f "$SCRIPT_DIR/apply-missing-updates.sh" ]; then
+    # The CoA world content is a versioned package inside the repository. A git
+    # update can ship a new baseline (data/coa-world/baseline.json): verify the
+    # package and show what is installed before the migrations are applied.
+    if [ -f "$SCRIPT_DIR/coa-world-data.sh" ]; then
+        AC_DIR="$AC_DIR" bash "$SCRIPT_DIR/coa-world-data.sh" verify \
+            || warn "world package check failed - see apps/coa-world/README.md"
+        AC_DIR="$AC_DIR" bash "$SCRIPT_DIR/coa-world-data.sh" status || true
+        log "re-import explicitly after a baseline change: FORCE=1 bash $SCRIPT_DIR/coa-world-data.sh bootstrap"
+    else
+        warn "coa-world-data.sh not found - world package check skipped"
+    fi
     DB_ROOT_PASSWORD="$DB_ROOT_PASSWORD" AC_DIR="$AC_DIR" \
         bash "$SCRIPT_DIR/apply-missing-updates.sh" \
         || warn "Update run reported errors - log: /root/apply-missing-updates.log"

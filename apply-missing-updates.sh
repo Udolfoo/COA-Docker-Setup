@@ -3,8 +3,9 @@
 #  apply-missing-updates.sh
 #  Applies SQL updates from the repo to the matching databases
 #  (auth / characters / world - plus acore_playerbots when the optional
-#  mod-playerbots module is installed). Typical case: a CoA world dump was
-#  imported and the AzerothCore auto-updater is disabled.
+#  mod-playerbots module is installed). Typical case: acore_world was
+#  bootstrapped from the versioned CoA world package (coa-world-data.sh) and
+#  the AzerothCore auto-updater is disabled.
 #
 #  Routing by source folder (= AzerothCore table `updates_include`):
 #    data/sql/updates/db_<db>         -> <db>  RELEASED   (apply pass 1)
@@ -21,7 +22,7 @@
 #    modules/mod-playerbots/data/sql/playerbots/custom  -> acore_playerbots CUSTOM
 #    modules/mod-playerbots/data/sql/world|characters   -> acore_world / acore_characters
 #  The module base data (names, texts, travel nodes) is imported once by
-#  `enable-playerbots.sh --db`, not here - just like the CoA world dump
+#  `enable-playerbots.sh --db`, not here - just like the CoA world package
 #  provides the world base data.
 #
 #  Application order mirrors UpdateFetcher::Update():

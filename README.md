@@ -25,26 +25,29 @@ fork (Conquest of AzerothCore) on your own Linux server – including a one-comm
 ```bash
 # 1) copy the scripts to your server (keep all files in the same folder)
 scp coa-oneclick.sh coa-update.sh coa-build.sh coa-check.sh coa-fix-network.sh \
-    apply-missing-updates.sh fix-config-warnings.py fix-quest-menu-overflow.py docker-compose.override.yml \
-    root@<SERVER-IP>:/root/
+    coa-world-data.sh apply-missing-updates.sh fix-config-warnings.py fix-quest-menu-overflow.py \
+    docker-compose.override.yml root@<SERVER-IP>:/root/
 # optional: enable-playerbots.sh, transfer-data.sh, patches/
 
-# 2) deploy (base: standard AzerothCore world, downloaded client data v20.0)
+# 2) deploy (CoA world from the repository package, downloaded client data v20.0)
 bash /root/coa-oneclick.sh 2>&1 | tee /root/coa-deploy.log
 ```
 
-With **CoA content**, simply upload the two data files to `/root` first – the script finds them
+With **CoA content**, simply upload the client data to `/root` first – the script finds it
 automatically (see [Data files](#data-files-required-for-real-coa-content)):
 
 ```bash
-scp databases.sql.gz Data.rar root@<SERVER-IP>:/root/     # from your PC
+scp Data.rar root@<SERVER-IP>:/root/     # from your PC
 bash /root/coa-oneclick.sh 2>&1 | tee /root/coa-deploy.log
 ```
 
-Or pass the paths explicitly:
+The CoA **world database** is not uploaded anymore: it comes from the versioned package
+inside the repository checkout and is imported with the official tool
+(`apps/coa-world/world_data.py`, see [CoA world database](#coa-world-database-official-package)).
+
+Or pass the path explicitly:
 
 ```bash
-COA_WORLD_DUMP=/root/databases.sql.gz \
 CLIENT_DATA=/root/Data.rar \
 GM_ACCOUNT=MyName:MyPass:3 \
 bash /root/coa-oneclick.sh 2>&1 | tee /root/coa-deploy.log
@@ -63,21 +66,19 @@ set realmlist <SERVER-IP>
 
 ## Data files (required for real CoA content)
 
-**These files are NOT part of this repository** – they cannot be redistributed publicly.
-Get them from the CoA Discord and upload them to your server. **This is the only manual step.**
+**Only the client data has to be uploaded – the world database comes with the repository.**
 
 | File | What it is | Where to get it |
 |---|---|---|
-| World database dump, e.g. `databases.sql.gz` | CoA world content (items, spells, quests, creatures) | CoA Discord – world/database package |
 | Client data, e.g. `Data.rar` | `dbc/`, `maps/`, `vmaps/`, `mmaps/` – required by the worldserver | CoA Discord – client data package |
 
-### Simplest way: drop them into `/root`
+### Simplest way: drop it into `/root`
 
-The script **finds the files automatically** – no options needed:
+The script **finds the file automatically** – no options needed:
 
 ```bash
-# 1) from your PC: upload both files to the server's /root
-scp databases.sql.gz Data.rar root@<SERVER-IP>:/root/
+# 1) from your PC: upload the client data to the server's /root
+scp Data.rar root@<SERVER-IP>:/root/
 
 # 2) run the deployment
 bash coa-oneclick.sh
@@ -86,16 +87,15 @@ bash coa-oneclick.sh
 The script tells you what it found:
 
 ```
-[INFO ] World database dump : /root/databases.sql.gz
 [INFO ] Client data         : /root/Data.rar
+[INFO ] CoA world database  : versioned package in the repository checkout (apps/coa-world)
 ```
 
-If nothing is found it prints `none found` and continues with standard AzerothCore content.
+If nothing is found it prints `none found` and auto-downloads the shared v20.0 client data.
 
-### Or pass the paths explicitly
+### Or pass the path explicitly
 
 ```bash
-COA_WORLD_DUMP=/root/my_dump.sql.gz \
 CLIENT_DATA=/root/clientdata.zip \
 GM_ACCOUNT=MyName:MyPass:3 \
 bash coa-oneclick.sh
@@ -103,15 +103,44 @@ bash coa-oneclick.sh
 
 ### Details
 
-* `COA_WORLD_DUMP` – any `.sql` or `.sql.gz` mysqldump. **Only the `acore_world` section is used**,
-  so a full "all databases" dump works fine: your accounts and characters stay untouched.
 * `CLIENT_DATA` – `.rar`, `.zip` or a folder containing `dbc`, `maps`, `vmaps`, `mmaps`.
   RAR5/WinRAR-7 archives are supported (the script installs RARLAB's `unrar`).
-* **Without these files the server still runs**: the `ac-client-data-init` container downloads the
-  standard client data (v20.0) and the standard AzerothCore world is used – just without CoA content.
+* **Without it the server still runs**: the `ac-client-data-init` container downloads the
+  standard client data (v20.0) – just without CoA client data.
 * **Alternative for the client data:** extract them yourself from a WoW 3.3.5a client.
   The map extractors are part of this repository and end up in `env/dist/bin/` after the build
   (`map_extractor`, `vmap4_extractor`, `vmap4_assembler`, `mmaps_generator`).
+
+---
+
+## CoA world database (official package)
+
+`acore_world` comes from the **versioned world package** that ships inside the
+`jealous-sound/azerothcore-wotlk-coa` checkout – following the official
+[apps/coa-world README](https://github.com/jealous-sound/azerothcore-wotlk-coa/blob/main/apps/coa-world/README.md):
+create an empty schema, then import the package before the first worldserver start.
+
+`coa-oneclick.sh` runs everything automatically. The same steps are available by hand:
+
+```bash
+bash /root/coa-world-data.sh install     # (re)install the MySQL client proxy
+bash /root/coa-world-data.sh verify      # package self-check (no database access)
+bash /root/coa-world-data.sh status      # what is installed in acore_world?
+bash /root/coa-world-data.sh bootstrap   # import into an EMPTY acore_world
+bash /root/coa-world-data.sh audit       # read-only comparison with the package
+FORCE=1 bash /root/coa-world-data.sh bootstrap   # recreate + re-import after a failure
+```
+
+* The package lives in the checkout (`data/coa-world/baseline.json` + `coa-world-<date>.zip`) –
+  a git update ships package updates; no `databases.sql.gz` upload is needed anymore.
+* The host has no MySQL client: `world_data.py` uses the MySQL 8.4 client **inside the
+  ac-database container** through the small proxy `/root/coa-mysql` (credentials from
+  `/opt/azerothcore/.env`); requires Python 3.11+ on the host (Debian 12/13: fine).
+* Bootstrap requires an empty schema, verifies package *and* imported content against
+  `baseline.json`, and never replaces installed data.
+* After the import, later migrations arrive through `apply-missing-updates.sh`
+  (same order and ledger as the AzerothCore updater); `bash coa-check.sh world` audits
+  the result at any time.
 
 ---
 
@@ -125,7 +154,7 @@ bash coa-oneclick.sh
 | Player bots (optional) | `WITH_PLAYERBOTS=1`: clones `modules/mod-playerbots`, writes `playerbots.conf`, creates `acore_playerbots` + the module base data (see [Player bots](#player-bots-optional)) |
 | Client data | Extracts `.rar`/`.zip`/folder (`CLIENT_DATA`) or lets the container download v20.0 |
 | Images | `docker compose build` (skipped when images already exist, forced with `WITH_PLAYERBOTS=1`) |
-| Database | Imports **only the `acore_world` part** of a CoA dump (auth/characters stay untouched), keeps a rollback copy as `acore_world_old`, disables the AzerothCore auto-updater |
+| Database | Creates the base databases once, imports **acore_world from the versioned CoA world package** with the official tool (`world_data.py`, empty schema required), disables the AzerothCore auto-updater |
 | Updates | Applies all missing repo SQL fixes for **auth, characters, world** – and `acore_playerbots` when the bot module is installed |
 | Start | Starts the stack, adds missing core options, sets the realm address |
 | Summary | Optional GM account + status report |
@@ -448,7 +477,7 @@ bash /root/coa-build.sh --full          # ignore the layer cache (ccache still a
 |---|---|
 | `Permission denied (publickey)` | install your SSH key on the server or use password login |
 | Build fails: `no matching member function for call to 'NearTeleportTo'` | upstream bug in mod-ascension-compat – the scripts patch it automatically, just re-run `bash coa-oneclick.sh` |
-| `Import failed (only 0 items in item_template)` | the base databases did not exist yet – run `cd /opt/azerothcore && docker compose up ac-db-import` once, then import the CoA dump again |
+| `Import failed (only 0 items in item_template)` | the base databases did not exist yet – run `cd /opt/azerothcore && docker compose up ac-db-import` once, then `FORCE_IMPORT=1 bash coa-oneclick.sh` |
 | Build fails: `use of undeclared identifier 'SPELL_EFFECT_NONE'` | run `bash coa-oneclick.sh` again – it patches the line automatically |
 | Build fails: `E: Unable to locate package tzdata`, `Some index files failed to download` after ~240 s | the build container cannot reach the apt mirrors (broken IPv6 or a DNS stub) – run `bash coa-fix-network.sh --build` (the deploy scripts call it automatically). Manual fix: pin Docker DNS (`/etc/docker/daemon.json` with `"dns": ["1.1.1.1","8.8.8.8"]`) and, if the host has no working IPv6, disable it (`net.ipv6.conf.all.disable_ipv6 = 1`) |
 | Every rebuild compiles from zero / takes 45-120 min | the ccache was empty: `bash coa-build.sh --stats` shows `Hits: 0 ... Misses: 2239` (Docker's build cache GC removed the cache mount, see [Build caching](#build-caching-why-a-rebuild-takes-minutes)). Fix: `bash coa-build.sh` (restores `/root/.coa-build/ccache.tar` into the mount before building) plus `bash coa-build.sh --gc-config` + `systemctl restart docker` to keep Docker's GC away from it. Never `docker builder prune` |
@@ -459,7 +488,7 @@ bash /root/coa-build.sh --full          # ignore the layer cache (ccache still a
 | Port 3306 already in use | `DB_EXTERNAL_PORT=127.0.0.1:13306` (the default) – only needed if a host MySQL/MariaDB runs |
 | `coa-update.sh` looks frozen after `Starting worldserver ...` | `docker compose up` is waiting for a dependency (`ac-database` healthy, `ac-db-import` / `ac-client-data-init` completed) or the worldserver is in a crash loop. Current scripts report progress every 15 s, stop after 5 / 7 minutes and print the `ac-*` container states plus the last 30 log lines. Older copies polled the port for 4 minutes without any output. Manual check: `cd /opt/azerothcore && docker compose ps -a`, `docker logs --tail 50 ac-worldserver`, `docker logs --tail 20 ac-client-data-init`, `df -h /` |
 | Worldserver restart loop, log: `Could not connect to MySQL database at ac-database: Unknown MySQL server host 'ac-database' (-3)` + `DatabasePool Login NOT opened` | MySQL error `-3` is `CR_UNKNOWN_HOST`, so the container cannot resolve the compose service name – **no database or image damage**. Check the database side with `bash /root/coa-check.sh db` (read-only: databases, MySQL users, a real login over the compose network) and repair the container side with `bash /root/coa-fix-network.sh --runtime`: it prints the facts (resolv.conf, networks, DNS aliases, `daemon.json`), probes the name with a throwaway container in the same network and then applies the smallest fix – restart the application containers, or recreate the stack so all containers share one network with a fresh resolver configuration and re-registered DNS aliases. Only if that is not enough does it remove a custom `"dns"` entry from `/etc/docker/daemon.json` (backup kept) and restart the Docker daemon. Data stays in the volumes. |
-| Vanity items: "has no AzerothCore item template yet" | CoA world data missing → import the CoA dump (`COA_WORLD_DUMP`) |
+| Vanity items: "has no AzerothCore item template yet" | CoA world data missing → `bash /root/coa-world-data.sh status`, then import: `bash /root/coa-world-data.sh bootstrap` (or `FORCE=1 … bootstrap` to recreate the schema) |
 | Worldserver log is flooded with `> Config: Missing property <KEY> in config file ... or module config` and `Config::LoadFile: Duplicate key name '<KEY>'` | The core loads `env/dist/etc/modules/<name>.conf` **only** – a module config that was never copied from its `.conf.dist` is not loaded at all, so every config key that module reads logs one warning per read (this server: 92 839 lines in one day from `mod-coa-challenges` and `mod-dynamic-xp`, because older `coa-oneclick.sh` copies activated three hard-coded modules). Neither message is an error – the hardcoded code default was used – but they bury real errors. Fix: `python3 /root/fix-config-warnings.py` – it fetches the module config templates from the image, activates every missing module config, defines the keys the log reported as missing (with the value that was in effect – the warning disappears and nothing else changes), keeps the value that was in effect for keys whose `.dist` default differs, removes the duplicate keys from `worldserver.conf` (the first definition is the one that counts), restarts the worldserver and verifies both message types are gone. Use `--dry-run` to see the report without writing anything. `coa-oneclick.sh` and `coa-update.sh` call it automatically with `--no-restart` before they start the stack (skip with `SKIP_CONFIG_FIX=1`), so a core update that adds a new module can no longer bring the flood back. |
 
 | Characters no longer learn their class abilities automatically (no new spells/ranks/talents on level up) | **Intended by the fork, not by this deployment:** `mod-spellbook` restores the **Books of Ascension** as class trainers and ships `AscensionCompat.AutoProgression = 0` (config file **and** code default) in `mod-ascension-compat` – abilities are bought from the books instead of being granted on level up (`AscensionCompat.cpp`: "Switched off, nothing is granted here and the player earns them another way"). The books only work once the two **pending world updates** are applied – `bash apply-missing-updates.sh` inserts them: `rev_20260918_21_spellbook_trainer.sql` moves the book templates to the `npc_spellbook_trainer` script plus the trainer flag (`0x30`), `rev_20260918_20_books_of_ascension.sql` restores the missing book creatures and the Ethereal Bazaar vendor. Without them the old `npc_ascension_training_book` gossip stays on the templates and – because `AutoProgression = 0` – grants nothing at all. Check: `docker exec -i ac-database mysql -uroot -p"$PW" acore_world -N -B -e "SELECT COUNT(*) FROM creature_template WHERE ScriptName='npc_spellbook_trainer'"` (must be > 0) and `bash coa-check.sh updates` (lists the two updates while they are missing). If you want the old automatic grants back instead: `AscensionCompat.AutoProgression = 1` in `env/dist/etc/modules/mod_ascension_compat.conf` + `docker compose restart ac-worldserver`. |
@@ -467,6 +496,7 @@ bash /root/coa-build.sh --full          # ignore the layer cache (ccache still a
 | Worldserver restart loop, log: `DatabasePool Playerbots NOT opened` | the module is compiled into the image, but `acore_playerbots` does not exist (hand-made `docker compose build` before `enable-playerbots.sh`) → `bash /root/enable-playerbots.sh --db` |
 | Log: `> AUTOUPDATER: Automatic database updates are disabled for all databases in the config!` (logger `server.playerbots`) | expected in this deployment: the bot database is maintained from the host (see [Player bots](#player-bots-optional)), the module's own updater has no sources in the runtime image |
 | Bots log in very slowly / the server lags with many bots | `PLAYERBOTS_COUNT` is too high for the machine (200 ≈ 3.5 GB, 1000 ≈ 10 GB) and `MapUpdate.Threads` too low – `bash /root/enable-playerbots.sh --config` after a `PLAYERBOTS_COUNT=... PLAYERBOTS_MAP_THREADS=...` change |
+| MySQL restart loop / healthcheck `Access denied for user 'root'@'localhost'` / log: `posix_fallocate … error number 28`, `Cannot resize redo log file … (Failed to set size)` | the disk was **full while MySQL initialized its data directory** (e.g. a parallel image build on a small VM) – the data directory is unusable and every restart fails the same way. Free space first (`df -h /`, `docker system df`), then recreate the database volume: `cd /opt/azerothcore && docker compose down`, `docker volume rm azerothcore_ac-database` (or move `…/_data` aside), start the stack again and import the world: `FORCE=1 bash /root/coa-world-data.sh bootstrap`. Budget: the image build + package import + client data want **~25 GB free** – a 19 GB VM cannot do build and import at the same time |
 
 ---
 
@@ -492,26 +522,28 @@ scp transfer-data.sh root@<NEW-SERVER>:/root/
 bash /root/transfer-data.sh <OLD-SERVER-IP> 9999
 ```
 
-`transfer-data.sh` creates the Docker volume if needed, downloads the world dump
-(`databases.sql.gz` from `/root`) plus `dbc/maps/vmaps/mmaps/Cameras`, replaces
-the directories completely (mixing two data sets breaks the server), fixes the
-ownership to uid 1000 and writes the `data-version` marker so the
-`ac-client-data-init` container does not download anything again.
+`transfer-data.sh` creates the Docker volume if needed, downloads
+`dbc/maps/vmaps/mmaps/Cameras`, replaces the directories completely (mixing two
+data sets breaks the server), fixes the ownership to uid 1000 and writes the
+`data-version` marker so the `ac-client-data-init` container does not download
+anything again. The world database is not transferred anymore – it is imported
+from the repository package (see [CoA world database](#coa-world-database-official-package)).
 
-Afterwards verify the DBC guard and import the world database:
+Afterwards verify the DBC guard and deploy:
 
 ```bash
 bash coa-check.sh dbc /var/lib/docker/volumes/azerothcore_ac-client-data/_data/dbc
 # -> 5/5 required rows present
-FORCE_IMPORT=1 COA_WORLD_DUMP=/root/databases.sql.gz bash coa-oneclick.sh
+bash coa-oneclick.sh          # imports the CoA world package if acore_world is empty
 ```
 
-The base databases must exist before the CoA world dump is imported. If the
-first deployment failed with `Import failed (only 0 items in item_template)`,
-run the AzerothCore importer once:
+The base databases (auth/characters/world) must exist before the CoA world
+package is imported – `coa-oneclick.sh` runs the AzerothCore importer
+automatically; by hand:
 
 ```bash
 cd /opt/azerothcore && docker compose up ac-db-import
+FORCE=1 bash /root/coa-world-data.sh bootstrap     # empty schema -> package -> audit
 ```
 
 ---
@@ -524,12 +556,13 @@ cd /opt/azerothcore && docker compose up ac-db-import
 | `coa-update.sh` | update: repo + core fixes + SQL updates + rebuild + restart (keeps the bot module in sync) |
 | `enable-playerbots.sh` | optional player bots: module + config + `acore_playerbots` + rebuild (`--prepare` / `--config` / `--db` / `--status`) |
 | `apply-missing-updates.sh` | applies repo SQL updates to auth/characters/world – and to playerbots when the module is installed (SHA1 + state exactly like AC) |
+| `coa-world-data.sh` | CoA world database per the official docs: `install` / `verify` / `status` / `bootstrap` (requires an empty schema) / `audit`; installs the `/root/coa-mysql` client proxy |
 | `coa-build.sh` | **the only place that builds the images**: network preflight, BuildKit build, ccache snapshot (restore + save), build cache GC policy; also `--stats`, `--gc-config`, `--restore` / `--save`, `--full` |
-| `coa-check.sh` | read-only checks: `db` (databases, MySQL users + a real login over the compose network), `updates` (which repo SQL is not registered yet), `dbc` (the 5 client DBC rows the core requires), `containers`, `all` |
+| `coa-check.sh` | read-only checks: `db` (databases, MySQL users + a real login over the compose network), `updates` (which repo SQL is not registered yet), `dbc` (the 5 client DBC rows the core requires), `world` (CoA world package status + the official read-only audit), `containers`, `all` |
 | `coa-fix-network.sh` | `--build` repairs container DNS/IPv6 so image builds reach the apt mirrors; `--runtime` repairs a running stack that cannot resolve `ac-database` (MySQL error -3); no argument = both |
-| `docker-compose.override.yml` | disables the auto-updater for CoA world data + log rotation + the ccache build args |
+| `docker-compose.override.yml` | disables the auto-updater for CoA world data (package import), ac-database without binlog + log rotation + the ccache build args |
 | `patches/db-<db>/*.sql` | project patches for tables the core/module code needs but upstream never shipped as SQL |
-| `transfer-data.sh` | copies the CoA world dump + client data from another server |
+| `transfer-data.sh` | copies the client data from another server (the world database comes from the repository package) |
 | `fix-config-warnings.py` | fetches the module config templates from the image, activates every module config, defines the keys the log reported as missing, removes duplicate keys, verifies the worldserver log is free of config warnings (runs automatically in `coa-oneclick.sh` / `coa-update.sh`) |
 | `fix-quest-menu-overflow.py` | caps the quest menu at `GOSSIP_MAX_MENU_ITEMS` – the Call Boards (43 quests) used to abort the worldserver; run automatically by `coa-update.sh` as build fix 3 |
 | `README.md` | this guide |
@@ -538,7 +571,8 @@ cd /opt/azerothcore && docker compose up ac-db-import
 
 ## Update semantics (what `coa-update.sh` / `apply-missing-updates.sh` apply)
 
-The CoA world dump is a **snapshot of one point in time**. Afterwards every update that exists in
+The CoA world package is a **verified snapshot of one point in time** (its covered migrations are
+registered in the `updates` ledger during bootstrap). Afterwards every update that exists in
 the repository is reconciled against the databases, so that all commits after that snapshot arrive.
 
 | Repository directory | State | Applied in |

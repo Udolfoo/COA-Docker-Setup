@@ -9,8 +9,9 @@
 #    3b. Optional: player bots (WITH_PLAYERBOTS=1 -> module + acore_playerbots)
 #    4. Client data: from archive/folder (CLIENT_DATA) or download v20.0
 #    5. Images: docker compose build
-#    6. Database: import only the acore_world part of a CoA dump, disable the
-#       AzerothCore auto-updater, apply all missing repo SQL updates
+#    6. Database: import the versioned CoA world package with the official
+#       tool (apps/coa-world/world_data.py), disable the AzerothCore
+#       auto-updater, apply all missing repo SQL updates
 #    7. Start the stack, add missing core options, set the realm address
 #    8. Optional GM account
 #    9. Status report
@@ -19,8 +20,13 @@
 #    bash coa-oneclick.sh
 #        -> installs what is missing; existing data is left untouched
 #
-#    COA_WORLD_DUMP=/root/databases.sql.gz CLIENT_DATA=/root/Data.rar \
-#    GM_ACCOUNT=MyName:MyPass:3 bash coa-oneclick.sh
+#    CLIENT_DATA=/root/Data.rar GM_ACCOUNT=MyName:MyPass:3 bash coa-oneclick.sh
+#
+#  Only the client data is uploaded (drop Data.rar into /root - the script
+#  finds it). The CoA world database is imported from the versioned package
+#  inside the repository checkout with the official tool
+#  (apps/coa-world/world_data.py, driven by coa-world-data.sh) - no world
+#  dump upload is needed anymore.
 #
 #  Player bots (optional, can also be added later with enable-playerbots.sh):
 #    WITH_PLAYERBOTS=1 bash coa-oneclick.sh
@@ -31,7 +37,7 @@
 #    DB_ROOT_PASSWORD=<random when empty>
 #    WORLD_PORT=8085  AUTH_PORT=3724  SOAP_PORT=7878
 #    DB_EXTERNAL_PORT=127.0.0.1:13306   (avoids conflicts with a host MariaDB)
-#    COA_WORLD_DUMP=<.sql/.sql.gz>      CLIENT_DATA=<.rar/.zip/folder>
+#    CLIENT_DATA=<.rar/.zip/folder>
 #    GM_ACCOUNT=<user:pass[:level]>
 #    FORCE_BUILD=0 FORCE_IMPORT=0 FORCE_CLIENT_DATA=0 FORCE_CONFIG=0 SKIP_SWAP=0
 #    WITH_PLAYERBOTS=0                  (1 = install the player bots as well)
@@ -54,7 +60,6 @@ AUTH_PORT="${AUTH_PORT:-3724}"
 SOAP_PORT="${SOAP_PORT:-7878}"
 IMAGE_TAG="${IMAGE_TAG:-coa}"
 PUBLIC_IP="${PUBLIC_IP:-}"
-COA_WORLD_DUMP="${COA_WORLD_DUMP:-}"
 CLIENT_DATA="${CLIENT_DATA:-}"
 GM_ACCOUNT="${GM_ACCOUNT:-}"
 FORCE_BUILD="${FORCE_BUILD:-0}"
@@ -92,21 +97,17 @@ mysql_file() {  # mysql_file <file>
 }
 
 # ------------------------------------------- Data file auto-detection
-# Users only need to upload the files to /root - no environment variables required.
-if [ -z "$COA_WORLD_DUMP" ]; then
-    for c in /root/databases.sql.gz /root/database.sql.gz /root/coa_world.sql.gz \
-             /root/coa-world.sql.gz /root/databases.sql /root/coa_world.sql /root/coa-world.sql; do
-        if [ -f "$c" ]; then COA_WORLD_DUMP="$c"; break; fi
-    done
-fi
+# Users only need to upload the client data to /root - no environment variables
+# required. The CoA world database comes from the versioned package in the
+# repository checkout (apps/coa-world/world_data.py), not from an upload.
 if [ -z "$CLIENT_DATA" ]; then
     for c in /root/Data.rar /root/data.rar /root/Data.zip /root/data.zip \
              /root/client-data /root/Data; do
         if [ -e "$c" ]; then CLIENT_DATA="$c"; break; fi
     done
 fi
-log "World database dump : ${COA_WORLD_DUMP:-none found (standard AzerothCore world will be used)}"
 log "Client data         : ${CLIENT_DATA:-none found (v20.0 will be downloaded automatically)}"
+log "CoA world database  : versioned package in the repository checkout (apps/coa-world)"
 
 # ------------------------------------------------------------- 1. Base
 step "1/9  Base: Docker, swap"
@@ -395,84 +396,71 @@ done
     || die "ac-database does not become healthy (see: docker logs ac-database)"
 ok "ac-database healthy"
 
-if [ -n "$COA_WORLD_DUMP" ]; then
-    [ -f "$COA_WORLD_DUMP" ] || die "COA_WORLD_DUMP not found: $COA_WORLD_DUMP"
+# The AzerothCore importer creates acore_auth/characters/world with the base
+# data; the CoA world content then comes from the versioned package inside the
+# repository checkout (apps/coa-world/world_data.py, see coa-world-data.sh).
+if [ "$(mysql_q "SELECT COUNT(1) FROM information_schema.tables WHERE table_schema='acore_world'" | head -1)" = "0" ]; then
+    log "Base databases missing -> running the AzerothCore importer once (a few minutes) ..."
+    # -d + poll: an attached "docker compose up ac-db-import" follows the
+    # dependency ac-database as well and would never return while it runs
+    docker compose up -d ac-db-import >/dev/null 2>&1
+    for _i in $(seq 1 360); do
+        [ "$(docker inspect -f '{{.State.Status}}' ac-db-import 2>/dev/null)" = "exited" ] && break
+        sleep 5
+    done
+    [ "$(docker inspect -f '{{.State.ExitCode}}' ac-db-import 2>/dev/null)" = "0" ] \
+        || die "ac-db-import failed - see: docker logs ac-db-import"
+    ok "Base databases created (auth/characters/world)"
+fi
 
-    # The AzerothCore importer creates acore_auth/characters/world with the base
-    # data. Without them the CoA dump has nowhere to go and the run would end
-    # with "Import failed (only 0 items in item_template)".
-    if [ "$(mysql_q "SELECT COUNT(1) FROM information_schema.tables WHERE table_schema='acore_world'" | head -1)" = "0" ]; then
-        log "Base databases missing -> running the AzerothCore importer once (a few minutes) ..."
-        docker compose up ac-db-import 2>&1 | tail -3
-        ok "Base databases created (auth/characters/world)"
-    fi
-
-    ITEMS_NOW="$(world_items)"; ITEMS_NOW="${ITEMS_NOW:-0}"
-    if [ "$ITEMS_NOW" -gt 400000 ] && [ "$FORCE_IMPORT" != "1" ]; then
-        ok "CoA world already imported (${ITEMS_NOW} items) - import skipped (FORCE_IMPORT=1 forces it)"
+# From here on acore_world belongs to the CoA package: the AzerothCore
+# auto-updater (ac-db-import) is turned into a no-op so that AC update SQL
+# cannot overwrite the CoA content; later migrations are applied below with
+# apply-missing-updates.sh (normal updater semantics).
+if [ ! -f docker-compose.override.yml ]; then
+    if [ -f "$SELF_DIR/docker-compose.override.yml" ]; then
+        cp "$SELF_DIR/docker-compose.override.yml" ./docker-compose.override.yml
+        ok "docker-compose.override.yml installed (auto-updater disabled)"
     else
-        log "Extracting the acore_world section from $(du -h "$COA_WORLD_DUMP" | cut -f1)"
-        python3 - "$COA_WORLD_DUMP" /tmp/coa_world_part.sql <<'PYEOF'
-import gzip, re, sys
-src, out = sys.argv[1], sys.argv[2]
-opener = gzip.open if src.endswith(".gz") else open
-marker = re.compile(rb"^-- Current Database: `([^`]+)`")
-cur = None; lines = 0
-with opener(src, "rb") as f, open(out, "wb") as g:
-    for line in f:
-        m = marker.match(line)
-        if m:
-            cur = m.group(1)
-            if cur == b"acore_world":
-                g.write(b"USE `acore_world`;\n")
-            continue
-        if cur == b"acore_world":
-            g.write(line); lines += 1
-print("   extracted to %s (%d lines)" % (out, lines))
-PYEOF
-        [ -s /tmp/coa_world_part.sql ] || die "Extraction empty - is this a mysqldump containing acore_world?"
-        docker compose stop ac-worldserver >/dev/null 2>&1 || true
-        if [ "$(mysql_q "SELECT COUNT(1) FROM information_schema.tables WHERE table_schema='acore_world_old'" | head -1)" = "0" ]; then
-            mysql_q "CREATE DATABASE IF NOT EXISTS acore_world_old DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-            mysql_q "SELECT CONCAT('RENAME TABLE acore_world.\`', table_name, '\` TO acore_world_old.\`', table_name, '\`;') FROM information_schema.tables WHERE table_schema='acore_world'" > /tmp/rename_world.sql
-            mysql_file /tmp/rename_world.sql >/dev/null 2>&1
-            ok "Backup of the old world: acore_world_old ($(wc -l < /tmp/rename_world.sql) tables)"
-        else
-            warn "acore_world_old already exists - keeping the previous backup"
-        fi
-        log "Importing the CoA world dump (2-10 minutes) ..."
-        mysql_file /tmp/coa_world_part.sql >/dev/null 2>&1
-        warn "Note: the last line of the dump (session restore) may report an error - harmless"
-        IMPORTED="$(world_items)"; IMPORTED="${IMPORTED:-0}"
-        [ "$IMPORTED" -gt 400000 ] || die "Import failed (only $IMPORTED items in item_template)"
-        ok "CoA world imported: ${IMPORTED} item templates"
-        rm -f /tmp/coa_world_part.sql
-    fi
-
-    if [ ! -f docker-compose.override.yml ]; then
-        if [ -f "$SELF_DIR/docker-compose.override.yml" ]; then
-            cp "$SELF_DIR/docker-compose.override.yml" ./docker-compose.override.yml
-            ok "docker-compose.override.yml installed (auto-updater disabled)"
-        else
-            warn "docker-compose.override.yml not found next to this script - copy it manually!"
-        fi
-    else
-        ok "docker-compose.override.yml present"
-    fi
-
-    # Apply missing repo/module SQL updates (core fixes not contained in the dump)
-    if [ -f "$SELF_DIR/apply-missing-updates.sh" ]; then
-        log "Applying missing repo SQL updates (core/module fixes) ..."
-        DB_ROOT_PASSWORD="$DB_ROOT_PASSWORD" AC_DIR="$AC_DIR" \
-            bash "$SELF_DIR/apply-missing-updates.sh" \
-            || warn "Update run reported errors - log: /root/apply-missing-updates.log"
-        ok "Repo updates checked and applied"
-    else
-        warn "apply-missing-updates.sh not found - repo updates skipped"
+        warn "docker-compose.override.yml not found next to this script - copy it manually!"
     fi
 else
-    warn "COA_WORLD_DUMP not set -> standard AzerothCore world (auto-updater stays active)"
-    [ -f docker-compose.override.yml ] && warn "Note: docker-compose.override.yml exists and disables ac-db-import"
+    ok "docker-compose.override.yml present"
+fi
+
+# CoA world database: the official package flow (apps/coa-world/README.md).
+# Verify + bootstrap + the final audit run inside coa-world-data.sh; it needs
+# Python 3.11+ and uses the MySQL client of the ac-database container.
+if [ ! -f "$SELF_DIR/coa-world-data.sh" ]; then
+    die "coa-world-data.sh not found next to this script - it performs the CoA world import"
+fi
+ITEMS_NOW="$(world_items)"; ITEMS_NOW="${ITEMS_NOW:-0}"
+if [ "$ITEMS_NOW" -gt 400000 ] && [ "$FORCE_IMPORT" != "1" ]; then
+    ok "CoA world already installed (${ITEMS_NOW} items) - package import skipped (FORCE_IMPORT=1 re-imports)"
+    log "full check any time:  bash coa-world-data.sh audit"
+else
+    if [ "$FORCE_IMPORT" = "1" ]; then
+        log "FORCE_IMPORT=1 -> acore_world is recreated and imported from the package"
+        FORCE=1 AC_DIR="$AC_DIR" bash "$SELF_DIR/coa-world-data.sh" bootstrap \
+            || die "CoA world package import failed (see output above)"
+    else
+        AC_DIR="$AC_DIR" bash "$SELF_DIR/coa-world-data.sh" bootstrap \
+            || die "CoA world package import failed (see output above)"
+    fi
+    IMPORTED="$(world_items)"; IMPORTED="${IMPORTED:-0}"
+    [ "$IMPORTED" -gt 400000 ] || die "Import failed (only $IMPORTED items in item_template)"
+    ok "CoA world imported from the package: ${IMPORTED} item templates"
+fi
+
+# Apply missing repo/module SQL updates (migrations after the package baseline)
+if [ -f "$SELF_DIR/apply-missing-updates.sh" ]; then
+    log "Applying missing repo SQL updates (core/module fixes) ..."
+    DB_ROOT_PASSWORD="$DB_ROOT_PASSWORD" AC_DIR="$AC_DIR" \
+        bash "$SELF_DIR/apply-missing-updates.sh" \
+        || warn "Update run reported errors - log: /root/apply-missing-updates.log"
+    ok "Repo updates checked and applied"
+else
+    warn "apply-missing-updates.sh not found - repo updates skipped"
 fi
 
 # ---------------------------------------------------- 6b. Player bots (opt.)

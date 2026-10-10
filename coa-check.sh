@@ -23,11 +23,15 @@
 #   dbc [dir] verifies the CoA client DBC set the core requires (5 rows);
 #             without a directory the client-data volume is used.
 #
+#   world     CoA world package: what is installed (quick) and a full read-only
+#             audit of acore_world against data/coa-world/baseline.json - the
+#             official "audit" from apps/coa-world/README.md.
+#
 #   containers  short container status report
 #
-#   (no argument = all of the above)
+#   (no argument = all of the above; "world" only runs the quick status there)
 #
-#  Usage: bash coa-check.sh [db|updates|dbc|containers|all] [dbc-dir]
+#  Usage: bash coa-check.sh [db|updates|dbc|containers|world|all] [dbc-dir]
 # ===========================================================================
 set -uo pipefail
 
@@ -39,7 +43,7 @@ DBC_DIR="${1:-}"
 
 case "$MODE" in
     -h|--help) sed -n '2,40p' "$0" | sed -e 's/^# \{0,1\}//' -e '/^$/d'; exit 0 ;;
-    all|db|updates|dbc|containers) ;;
+    all|db|updates|dbc|containers|world) ;;
     *) printf 'unknown mode: %s   (bash %s --help)\n' "$MODE" "$0" >&2; exit 2 ;;
 esac
 
@@ -299,6 +303,29 @@ PYEOF
     fi
 }
 
+# --- CoA world package ------------------------------------------------------
+#  the official tools: "status" is a quick look, "audit" compares the whole
+#  acore_world content with the versioned package (read-only, takes a minute)
+mode_world_status() {
+    hdr "CoA world package"
+    if [ -f "$SCRIPT_DIR/coa-world-data.sh" ]; then
+        AC_DIR="$AC_DIR" bash "$SCRIPT_DIR/coa-world-data.sh" status || true
+    else
+        bad "coa-world-data.sh not found next to this script"
+        return 1
+    fi
+}
+
+mode_world() {
+    mode_world_status
+    hdr "CoA world audit (official tool, read-only)"
+    if [ -f "$SCRIPT_DIR/coa-world-data.sh" ]; then
+        AC_DIR="$AC_DIR" bash "$SCRIPT_DIR/coa-world-data.sh" audit
+    else
+        return 1
+    fi
+}
+
 # ---------------------------------------------------------------- dispatcher
 rc=0
 case "$MODE" in
@@ -306,10 +333,12 @@ case "$MODE" in
     updates)    mode_updates; rc=$? ;;
     dbc)        mode_dbc; rc=$? ;;
     containers) mode_containers; rc=$? ;;
+    world)      mode_world; rc=$? ;;
     all)
         mode_containers
         mode_db;        rc=$?
         mode_updates
+        mode_world_status
         mode_dbc || rc=1
         echo
         echo "=== all checks done (nothing was changed) ==="

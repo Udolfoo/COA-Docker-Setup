@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Copy the CoA world dump + client data from the old server to this one.
+# Copy the client data (dbc/maps/vmaps/mmaps/Cameras) from the old server to
+# this one. The CoA world database no longer travels as a file: it is imported
+# on this server from the versioned package in the repository checkout
+# (bash coa-world-data.sh bootstrap, see apps/coa-world/README.md).
 #
 # Run this ON THE NEW SERVER. It downloads over plain HTTP from a temporary
 # python http.server started on the old server (only while the copy runs).
 #
-#   1) on the OLD server (85.190.241.176), in a screen/tmux or detached:
+#   1) on the OLD server, in a screen/tmux or detached:
+#        VOL=/var/lib/docker/volumes/azerothcore_ac-client-data/_data
+#        cd "$VOL" && for s in dbc maps vmaps mmaps Cameras; do tar -cf "/root/client-data-$s.tar" "$s"; done
 #        nohup python3 -m http.server 9999 --directory /root >/tmp/http.log 2>&1 &
 #   2) on the NEW server:
 #        sudo bash transfer-data.sh 85.190.241.176 9999
@@ -36,14 +41,15 @@ fi
 [ -n "$VOLUME" ] || { fail "cannot determine the client data volume"; exit 1; }
 ok "volume ${PROJ}_${VOLNAME} -> $VOLUME"
 
-echo "=== 1) CoA world dump ==="
-if [ -s /root/databases.sql.gz ]; then
-    ok "already present: $(du -h /root/databases.sql.gz | cut -f1)"
+echo "=== 1) CoA world database (versioned package in the checkout) ==="
+info "no upload needed - imported on this server from the repository package"
+if [ -f /root/coa-world-data.sh ]; then
+    AC_DIR="$AC_DIR" bash /root/coa-world-data.sh verify \
+        && ok "world package present and verified" \
+        || warn "world package check failed - see apps/coa-world/README.md"
+    info "import it after the base databases exist:  bash /root/coa-world-data.sh bootstrap"
 else
-    info "downloading http://$OLD_HOST:$PORT/databases.sql.gz"
-    curl -fL --progress-bar "http://$OLD_HOST:$PORT/databases.sql.gz" -o /root/databases.sql.gz \
-        || { fail "download failed - is the http.server running on the old server?"; exit 1; }
-    ok "downloaded $(du -h /root/databases.sql.gz | cut -f1)"
+    warn "coa-world-data.sh not found in /root - copy it together with the other scripts"
 fi
 
 echo
@@ -76,6 +82,7 @@ echo
 echo "=== 4) summary ==="
 du -sh "$VOLUME"/* 2>/dev/null
 echo
-echo "next: verify the DBC guard rows, then import the CoA world"
+echo "next: verify the DBC guard rows, then run the deployment"
 echo "  bash /root/coa-check.sh dbc          # 5 required DBC rows"
-echo "  FORCE_IMPORT=1 COA_WORLD_DUMP=/root/databases.sql.gz bash coa-oneclick.sh"
+echo "  bash /root/coa-check.sh world        # CoA world package status + audit"
+echo "  bash /root/coa-oneclick.sh           # imports the CoA world if needed, starts the stack"
