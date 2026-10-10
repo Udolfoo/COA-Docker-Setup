@@ -533,7 +533,19 @@ for dist in "$ETC"/modules/*.conf.dist; do
     fi
 done
 
-# Ascension compat: allow remote clients + absolute DBC path
+# Remote clients: the CoA core (WorldSocket.cpp) enables the Ascension client
+# protocol only for loopback connections or with CoA.AllowRemoteClients = 1.
+# Without it a player from the internet is kicked right after character
+# selection ("WorldSocket::ReadHeaderHandler(): sent malformed packet").
+# Older fork revisions used AscensionCompat.AllowRemoteClients in
+# mod_ascension_compat.conf - keep that path for old checkouts.
+ACF="$ETC/modules/coa.conf"
+if [ -f "$ACF" ]; then
+    sed -i 's/^CoA\.AllowRemoteClients *=.*/CoA.AllowRemoteClients = 1/' "$ACF"
+    grep -q '^CoA.AllowRemoteClients = 1' "$ACF" \
+        && ok "CoA.AllowRemoteClients=1 set (remote Ascension clients accepted)" \
+        || warn "Please check $ACF: CoA.AllowRemoteClients = 1"
+fi
 ACA="$ETC/modules/mod_ascension_compat.conf"
 if [ -f "$ACA" ]; then
     sed -i 's/^AscensionCompat\.AllowRemoteClients *=.*/AscensionCompat.AllowRemoteClients = 1/' "$ACA"
